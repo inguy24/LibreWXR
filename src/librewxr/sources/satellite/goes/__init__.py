@@ -63,6 +63,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
         return []
 
     retention = getattr(settings, "satellite_max_frames", 36)
+    bbox = getattr(settings, "get_bbox", lambda: None)()
     contributions: list[SatelliteContribution] = []
 
     if center_lon < -100.0:
@@ -71,7 +72,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
             contributions.append(
                 SatelliteContribution(
                     instance=GOES18IRSource(
-                        cache_dir=cache_dir, max_frames=retention,
+                        cache_dir=cache_dir, max_frames=retention, bbox=bbox,
                     ),
                     priority=5,
                     name="GOES-18 IR",
@@ -82,7 +83,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
             contributions.append(
                 SatelliteContribution(
                     instance=GOES18VISSource(
-                        cache_dir=cache_dir, max_frames=retention,
+                        cache_dir=cache_dir, max_frames=retention, bbox=bbox,
                     ),
                     priority=6,
                     name="GOES-18 VIS",
@@ -95,7 +96,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
             contributions.append(
                 SatelliteContribution(
                     instance=GOES19IRSource(
-                        cache_dir=cache_dir, max_frames=retention,
+                        cache_dir=cache_dir, max_frames=retention, bbox=bbox,
                     ),
                     priority=5,
                     name="GOES-19 IR",
@@ -106,7 +107,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
             contributions.append(
                 SatelliteContribution(
                     instance=GOES19VISSource(
-                        cache_dir=cache_dir, max_frames=retention,
+                        cache_dir=cache_dir, max_frames=retention, bbox=bbox,
                     ),
                     priority=6,
                     name="GOES-19 VIS",
