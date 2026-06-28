@@ -110,6 +110,15 @@ class GMGSISource:
         self._fs: fsspec.AbstractFileSystem | None = None
         self._max_frames = max_frames
 
+        # BBOX crop bounds — when LIBREWXR_BBOX is set, satellite grids
+        # are cropped from the full 3000×5000 global grid to just the
+        # rows/cols covering the bounding box.  Without BBOX, stores the
+        # full grid (no-op crop).
+        self._crop_row_start: int = 0
+        self._crop_col_start: int = 0
+        self._cropped_shape: tuple[int, int] = GRID_SHAPE
+        self._init_bbox_crop()
+
         resolved_cache_root = cache_dir
         self._cache_root: Path | None = (
             Path(resolved_cache_root) if resolved_cache_root else None
@@ -121,6 +130,53 @@ class GMGSISource:
         if self._channel_cache_dir is not None:
             self._channel_cache_dir.mkdir(parents=True, exist_ok=True)
             self._load_cached_frames()
+
+    def _init_bbox_crop(self) -> None:
+        """Compute row/col crop bounds from LIBREWXR_BBOX if configured.
+
+        The GMGSI grid uses Mercator-spaced rows (uniform in
+        y=atanh(sin(lat))), so latitude → row conversion must go
+        through the Mercator projection.  Longitude is linear.
+
+        Adds a 1-pixel pad on each edge so bilinear sampling (Phase 4)
+        won't need a bounds check.
+        """
+        try:
+            from librewxr.config import settings
+        except ImportError:
+            return
+        bbox = settings.get_bbox()
+        if bbox is None:
+            return
+
+        south, west, north, east = bbox
+        pad = 1
+
+        sin_north = np.clip(np.sin(np.deg2rad(north)), -0.9999, 0.9999)
+        sin_south = np.clip(np.sin(np.deg2rad(south)), -0.9999, 0.9999)
+        y_north = float(np.arctanh(sin_north))
+        y_south = float(np.arctanh(sin_south))
+
+        row_start = max(0, int((_Y_MAX - y_north) / _Y_STEP) - pad)
+        row_end = min(GRID_HEIGHT, int((_Y_MAX - y_south) / _Y_STEP) + 1 + pad)
+
+        lon_step = (LON_MAX - LON_MIN) / (GRID_WIDTH - 1)
+        col_start = max(0, int((west - LON_MIN) / lon_step) - pad)
+        col_end = min(GRID_WIDTH, int((east - LON_MIN) / lon_step) + 1 + pad)
+
+        self._crop_row_start = row_start
+        self._crop_col_start = col_start
+        self._cropped_shape = (row_end - row_start, col_end - col_start)
+
+        full_kb = GRID_HEIGHT * GRID_WIDTH / 1024
+        crop_kb = self._cropped_shape[0] * self._cropped_shape[1] / 1024
+        logger.info(
+            "%s: BBOX crop [%d:%d, %d:%d] → %d×%d (%.1f KB, was %.0f KB)",
+            self.friendly_name,
+            row_start, row_end, col_start, col_end,
+            self._cropped_shape[0], self._cropped_shape[1],
+            crop_kb, full_kb,
+        )
 
     # ── Public state ──
 
@@ -314,6 +370,18 @@ class GMGSISource:
             # Treat NaN / out-of-range as no-data sentinel (0).
             data = np.where(np.isfinite(data), data, 0.0)
             data = np.clip(data, 0, 255).astype(GRID_DTYPE)
+
+            # BBOX crop — slice the full global grid down to the
+            # configured region.  The copy() detaches from the full
+            # array so the GC can free the ~15 MB original.
+            if self._cropped_shape != GRID_SHAPE:
+                rs = self._crop_row_start
+                cs = self._crop_col_start
+                data = data[
+                    rs : rs + self._cropped_shape[0],
+                    cs : cs + self._cropped_shape[1],
+                ].copy()
+
             return data
         finally:
             ds.close()
@@ -327,7 +395,7 @@ class GMGSISource:
     def _write_cache(self, unix_ts: int, arr: np.ndarray) -> None:
         final = self._cache_path_for(unix_ts)
         tmp = final.with_suffix(".dat.tmp")
-        mm = np.memmap(tmp, dtype=GRID_DTYPE, mode="w+", shape=GRID_SHAPE)
+        mm = np.memmap(tmp, dtype=GRID_DTYPE, mode="w+", shape=self._cropped_shape)
         mm[:] = arr
         mm.flush()
         del mm
@@ -338,7 +406,7 @@ class GMGSISource:
         if not path.exists():
             return None
         try:
-            return np.memmap(path, dtype=GRID_DTYPE, mode="r", shape=GRID_SHAPE)
+            return np.memmap(path, dtype=GRID_DTYPE, mode="r", shape=self._cropped_shape)
         except Exception:
             logger.warning(
                 "%s: failed to memmap %s, removing", self.friendly_name, path,
@@ -391,8 +459,12 @@ class GMGSISource:
         """Sample encoded uint8 values at the given lat/lon points.
 
         Nearest-neighbour for Phase 1 — bilinear is a Phase 4 polish.
-        Returns 0 (no data) outside the global ±72.74° latitude band.
+        Returns 0 (no data) outside the stored grid extent.
         Always returns a uint8 array shaped like ``lat``/``lon``.
+
+        When LIBREWXR_BBOX is active the grid is cropped, so row/col
+        indices are offset by the crop origin and bounds-checked against
+        the cropped dimensions.
         """
         out = np.zeros(lat.shape, dtype=GRID_DTYPE)
         ts = self._nearest_timestamp(timestamp)
@@ -404,24 +476,20 @@ class GMGSISource:
         # Mercator row inversion: rows are uniform in y=atanh(sin(lat)),
         # not in lat.  Clip sin(lat) shy of ±1 so atanh stays finite at
         # the geometric poles even though the in_bounds mask below will
-        # zero out anything past LAT_MAX/LAT_MIN anyway.
+        # zero out anything past the grid extent anyway.
         sin_lat = np.clip(
             np.sin(np.deg2rad(lat.astype(np.float64))), -0.9999, 0.9999,
         )
         y_query = np.arctanh(sin_lat)
-        row = ((_Y_MAX - y_query) / _Y_STEP).astype(np.int32)
+        row = ((_Y_MAX - y_query) / _Y_STEP).astype(np.int32) - self._crop_row_start
 
         lon_step = (LON_MAX - LON_MIN) / (GRID_WIDTH - 1)
-        col = ((lon - LON_MIN) / lon_step).astype(np.int32)
+        col = ((lon - LON_MIN) / lon_step).astype(np.int32) - self._crop_col_start
 
-        # Mask points outside the global band — leave them at the
-        # zero sentinel rather than wrapping or clamping silently.
-        in_bounds = (
-            (lat <= LAT_MAX) & (lat >= LAT_MIN)
-            & (lon >= LON_MIN) & (lon <= LON_MAX)
-        )
-        row = np.clip(row, 0, GRID_HEIGHT - 1)
-        col = np.clip(col, 0, GRID_WIDTH - 1)
+        h, w = self._cropped_shape
+        in_bounds = (row >= 0) & (row < h) & (col >= 0) & (col < w)
+        row = np.clip(row, 0, h - 1)
+        col = np.clip(col, 0, w - 1)
 
         sampled = grid[row, col]
         out = np.where(in_bounds, sampled, 0).astype(GRID_DTYPE)
@@ -441,20 +509,27 @@ class GMGSISource:
 
         Render workers don't repeat the S3 fetch — they re-open the
         cached memmaps that the pipeline already wrote to disk.  So
-        the snapshot only carries the cache root, channel, and a list
-        of known timestamps; ``__setstate__`` re-memmaps each one.
+        the snapshot only carries the cache root, channel, list of
+        known timestamps, and BBOX crop bounds; ``__setstate__``
+        restores the crop geometry and re-memmaps each frame.
         """
         return {
             "cache_root": str(self._cache_root) if self._cache_root else None,
             "channel": self.channel,
             "timestamps": list(self._sorted_timestamps),
             "max_frames": self._max_frames,
+            "crop_row_start": self._crop_row_start,
+            "crop_col_start": self._crop_col_start,
+            "cropped_shape": list(self._cropped_shape),
         }
 
     def __setstate__(self, state: dict) -> None:
         cache_root = state.get("cache_root")
         self._cache_root = Path(cache_root) if cache_root else None
         self._max_frames = state.get("max_frames", 12)
+        self._crop_row_start = state.get("crop_row_start", 0)
+        self._crop_col_start = state.get("crop_col_start", 0)
+        self._cropped_shape = tuple(state.get("cropped_shape", list(GRID_SHAPE)))
         self._frames = {}
         self._sorted_timestamps = []
         self._fs = None
