@@ -60,18 +60,27 @@ class GeoSatSource:
         self,
         cache_dir: Path | None = None,
         max_frames: int = 36,
+        bbox: tuple[float, float, float, float] | None = None,
     ) -> None:
         self.name = self.friendly_name
         self._frames: dict[int, np.ndarray] = {}
         self._sorted_timestamps: list[int] = []
         self._fs: fsspec.AbstractFileSystem | None = None
         self._max_frames = max_frames
+        self._bbox = bbox
 
         # Per-frame grid metadata (set on first decode)
         self._x_vec: np.ndarray | None = None  # 1-D scan-angle x coords
         self._y_vec: np.ndarray | None = None  # 1-D scan-angle y coords
         self._grid_height: int = 0
         self._grid_width: int = 0
+
+        # BBOX crop indices (computed once after first grid init)
+        self._crop_row_start: int = 0
+        self._crop_row_end: int = 0
+        self._crop_col_start: int = 0
+        self._crop_col_end: int = 0
+        self._crop_computed: bool = False
 
         self._cache_root: Path | None = (
             Path(cache_dir) if cache_dir else None
@@ -133,6 +142,11 @@ class GeoSatSource:
             arr = self._download_and_decode(fs, s3_key)
             if arr is None:
                 continue
+            if self._crop_computed:
+                arr = arr[
+                    self._crop_row_start:self._crop_row_end,
+                    self._crop_col_start:self._crop_col_end,
+                ].copy()
             self._frames[unix_ts] = arr
             new_count += 1
             if self._channel_cache_dir is not None:
@@ -245,13 +259,94 @@ class GeoSatSource:
 
         Only runs once — subsequent frames reuse the stored vectors
         (the fixed-grid coordinates never change for a given product).
+        If a BBOX is configured, computes the crop slice in scan-angle
+        space and trims the vectors to only the BBOX region.
         """
         if self._x_vec is not None:
             return
-        self._x_vec = ds["x"].values.astype(np.float64)
-        self._y_vec = ds["y"].values.astype(np.float64)
+        full_x = ds["x"].values.astype(np.float64)
+        full_y = ds["y"].values.astype(np.float64)
+        full_h = len(full_y)
+        full_w = len(full_x)
+
+        if self._bbox is not None and not self._crop_computed:
+            self._compute_crop_indices(full_x, full_y, full_w, full_h)
+
+        if self._crop_computed:
+            self._x_vec = full_x[self._crop_col_start:self._crop_col_end]
+            self._y_vec = full_y[self._crop_row_start:self._crop_row_end]
+        else:
+            self._x_vec = full_x
+            self._y_vec = full_y
         self._grid_width = len(self._x_vec)
         self._grid_height = len(self._y_vec)
+
+        if self._crop_computed:
+            uncropped_kb = full_h * full_w / 1024
+            cropped_kb = self._grid_height * self._grid_width / 1024
+            logger.info(
+                "%s: BBOX crop [%d:%d, %d:%d] → %d×%d (%.1f KB, was %.0f KB)",
+                self.friendly_name,
+                self._crop_row_start, self._crop_row_end,
+                self._crop_col_start, self._crop_col_end,
+                self._grid_height, self._grid_width,
+                cropped_kb, uncropped_kb,
+            )
+
+    def _compute_crop_indices(
+        self,
+        full_x: np.ndarray,
+        full_y: np.ndarray,
+        full_w: int,
+        full_h: int,
+    ) -> None:
+        """Compute row/col crop slice for the configured BBOX.
+
+        Projects the BBOX corners to scan-angle space, finds the
+        bounding scan-angle range, and maps that to array indices
+        with a small margin for safety.
+        """
+        south, west, north, east = self._bbox
+        corners_lat = np.array([south, south, north, north])
+        corners_lon = np.array([west, east, west, east])
+
+        x_ang, y_ang = geo_forward(
+            corners_lat, corners_lon, self.sat_lon, self.sat_height,
+        )
+        visible = ~(np.isnan(x_ang) | np.isnan(y_ang))
+        if not visible.any():
+            return
+
+        x_min = float(np.nanmin(x_ang[visible]))
+        x_max = float(np.nanmax(x_ang[visible]))
+        y_min = float(np.nanmin(y_ang[visible]))
+        y_max = float(np.nanmax(y_ang[visible]))
+
+        margin = 0.005  # ~0.3° extra on each side
+
+        col_start = int(np.searchsorted(full_x, x_min - margin))
+        col_end = int(np.searchsorted(full_x, x_max + margin, side="right"))
+        col_start = max(0, col_start)
+        col_end = min(full_w, col_end)
+
+        # y_vec is typically descending (north to south)
+        if full_y[0] > full_y[-1]:
+            row_start = int(np.searchsorted(-full_y, -(y_max + margin)))
+            row_end = int(np.searchsorted(-full_y, -(y_min - margin), side="right"))
+        else:
+            row_start = int(np.searchsorted(full_y, y_min - margin))
+            row_end = int(np.searchsorted(full_y, y_max + margin, side="right"))
+        row_start = max(0, row_start)
+        row_end = min(full_h, row_end)
+
+        if row_end <= row_start or col_end <= col_start:
+            return
+
+        self._crop_row_start = row_start
+        self._crop_row_end = row_end
+        self._crop_col_start = col_start
+        self._crop_col_end = col_end
+        self._crop_computed = True
 
     # ── Sampling ──
 
@@ -411,12 +506,14 @@ class GeoSatSource:
             "timestamps": list(self._sorted_timestamps),
             "max_frames": self._max_frames,
             "bucket": self.s3_bucket,
+            "bbox": self._bbox,
         }
 
     def __setstate__(self, state: dict) -> None:
         cache_root = state.get("cache_root")
         self._cache_root = Path(cache_root) if cache_root else None
         self._max_frames = state.get("max_frames", 36)
+        self._bbox = state.get("bbox")
         self._frames = {}
         self._sorted_timestamps = []
         self._fs = None
@@ -424,6 +521,11 @@ class GeoSatSource:
         self._y_vec = None
         self._grid_height = 0
         self._grid_width = 0
+        self._crop_row_start = 0
+        self._crop_row_end = 0
+        self._crop_col_start = 0
+        self._crop_col_end = 0
+        self._crop_computed = False
         self.name = self.friendly_name
 
         if self._cache_root is None:
