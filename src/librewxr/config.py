@@ -504,8 +504,8 @@ class Settings(BaseSettings):
             return None
         parts = [float(x.strip()) for x in self.bbox.split(",")]
         south, west, north, east = parts[0], parts[1], parts[2], parts[3]
-        lat_pad = (north - south) / 2
-        lon_pad = (east - west) / 2
+        lat_pad = (north - south) * 1.5
+        lon_pad = (east - west) * 1.5
         return (south - lat_pad, west - lon_pad, north + lat_pad, east + lon_pad)
 
     def get_enabled_regions(self) -> list[str]:
