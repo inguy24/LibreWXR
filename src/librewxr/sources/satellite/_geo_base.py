@@ -146,20 +146,7 @@ class GeoSatSource:
             arr = self._download_and_decode(fs, s3_key)
             if arr is None:
                 continue
-            if self._crop_computed:
-                arr = arr[
-                    self._crop_row_start:self._crop_row_end,
-                    self._crop_col_start:self._crop_col_end,
-                ].copy()
-            if self._downsample_factor > 1:
-                f = self._downsample_factor
-                h, w = arr.shape
-                arr = (
-                    arr[: h - h % f, : w - w % f]
-                    .reshape(h // f, f, w // f, f)
-                    .mean(axis=(1, 3))
-                    .astype(np.uint8)
-                )
+            arr = self._apply_post_decode(arr)
             self._frames[unix_ts] = arr
             new_count += 1
             if self._channel_cache_dir is not None:
@@ -245,9 +232,34 @@ class GeoSatSource:
             return None
         return int(dt.timestamp())
 
+    def _apply_post_decode(self, arr: np.ndarray) -> np.ndarray:
+        """Apply BBOX crop and downsampling to a full-size decoded grid."""
+        if self._crop_computed:
+            arr = arr[
+                self._crop_row_start:self._crop_row_end,
+                self._crop_col_start:self._crop_col_end,
+            ].copy()
+        if self._downsample_factor > 1:
+            f = self._downsample_factor
+            h, w = arr.shape
+            arr = (
+                arr[: h - h % f, : w - w % f]
+                .reshape(h // f, f, w // f, f)
+                .mean(axis=(1, 3))
+                .astype(np.uint8)
+            )
+        return arr
+
     def _download_and_decode(
         self, fs: fsspec.AbstractFileSystem, s3_key: str,
     ) -> np.ndarray | None:
+        """Download and decode a satellite frame.
+
+        When BBOX crop indices are established (after the first frame),
+        streams only the BBOX region via HDF5 chunked reads.  The
+        returned array is ready to store — crop and downsample are
+        already applied for the streaming path.
+        """
         if self._crop_computed and self._x_vec is not None:
             return self._stream_cropped(fs, s3_key)
         try:
@@ -296,7 +308,17 @@ class GeoSatSource:
                         dqf = hf["DQF"][rs:re, cs:ce]
                         cmi = np.where(dqf == 0, cmi, np.nan)
 
-                    return self._map_to_uint8(cmi)
+                    arr = self._map_to_uint8(cmi)
+                    if self._downsample_factor > 1:
+                        f = self._downsample_factor
+                        h, w = arr.shape
+                        arr = (
+                            arr[: h - h % f, : w - w % f]
+                            .reshape(h // f, f, w // f, f)
+                            .mean(axis=(1, 3))
+                            .astype(np.uint8)
+                        )
+                    return arr
         except Exception:
             logger.exception(
                 "%s: stream/decode failed for %s", self.friendly_name, s3_key,
