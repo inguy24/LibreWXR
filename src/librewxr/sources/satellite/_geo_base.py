@@ -146,7 +146,6 @@ class GeoSatSource:
             arr = self._download_and_decode(fs, s3_key)
             if arr is None:
                 continue
-            arr = self._apply_post_decode(arr)
             self._frames[unix_ts] = arr
             new_count += 1
             if self._channel_cache_dir is not None:
@@ -265,7 +264,8 @@ class GeoSatSource:
         try:
             with tempfile.NamedTemporaryFile(suffix=".nc") as tmp:
                 fs.get(s3_key, tmp.name)
-                return self._decode_netcdf(tmp.name)
+                arr = self._decode_netcdf(tmp.name)
+                return self._apply_post_decode(arr) if arr is not None else None
         except Exception:
             logger.exception(
                 "%s: download/decode failed for %s", self.friendly_name, s3_key,
