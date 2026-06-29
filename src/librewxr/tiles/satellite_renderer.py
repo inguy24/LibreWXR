@@ -21,8 +21,8 @@ _DISK_EDGE_FEATHER_DEGREES = 2.0
 # this (encoded > threshold) are treated as cloud and rendered opaque;
 # warmer pixels (ground / ocean / low cloud) ramp to fully transparent.
 # Roughly 270 K on GMGSI's 0–255 brightness-temperature scale.
-_LW_CLOUD_THRESHOLD = 110.0
-_LW_CLOUD_MAX = 255.0
+_LW_CLOUD_THRESHOLD = 30.0
+_LW_CLOUD_MAX = 200.0
 
 
 def _lw_brightness_and_alpha(
