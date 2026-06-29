@@ -37,6 +37,7 @@ from librewxr.tiles.satellite_renderer import (
     render_geo_satellite_tile,
     render_gmgsi_composite_tile,
     render_gmgsi_tile,
+    render_multi_satellite_tile,
 )
 
 logger = logging.getLogger(__name__)
@@ -492,6 +493,38 @@ def _find_satellite_sources() -> tuple[object | None, object | None]:
     return None, None
 
 
+def _find_all_satellite_families() -> dict[str, tuple[object | None, object | None]]:
+    """Return all loaded satellite families with their IR and VIS sources.
+
+    Returns a dict mapping family name -> (ir_source, vis_source | None).
+    Unlike _find_satellite_sources() which returns only the first family,
+    this returns ALL families with loaded IR data.
+    """
+    if not satellite_grids:
+        return {}
+
+    by_family: dict[str, dict[str, object]] = {}
+    for slug, grid in satellite_grids.items():
+        if grid is None or not bool(grid.timestamps):
+            continue
+        if slug.endswith("_ir_grid"):
+            family = slug[: -len("_ir_grid")]
+            by_family.setdefault(family, {})["ir"] = grid
+        elif slug.endswith("_lw_grid"):
+            family = slug[: -len("_lw_grid")]
+            by_family.setdefault(family, {})["ir"] = grid
+        elif slug.endswith("_vis_grid"):
+            family = slug[: -len("_vis_grid")]
+            by_family.setdefault(family, {})["vis"] = grid
+
+    result: dict[str, tuple[object | None, object | None]] = {}
+    for family, channels in by_family.items():
+        if "ir" in channels:
+            result[family] = (channels["ir"], channels.get("vis"))
+
+    return result
+
+
 @router.get("/v2/satellite/{timestamp}/{size}/{z}/{x}/{y}/0/0_0.{ext}")
 async def satellite_tile(
     timestamp: int,
@@ -509,6 +542,10 @@ async def satellite_tile(
     (GOES vs Himawari vs GMGSI) is handled at startup by the satellite
     provider auto-selection — by the time we get here, ``satellite_grids``
     already has the right sources registered by slug.
+
+    When multiple geostationary families are loaded (e.g. GOES-18 + GOES-19),
+    the multi-satellite renderer composites them per-pixel, preferring the
+    source whose sub-satellite longitude is closest to the pixel.
     """
     if z > settings.max_zoom:
         raise HTTPException(status_code=400, detail=f"Zoom {z} exceeds max {settings.max_zoom}")
@@ -519,18 +556,34 @@ async def satellite_tile(
 
     tile_size = 512 if size >= 512 else 256
 
-    ir_source, vis_source = _find_satellite_sources()
-    has_ir = ir_source is not None
-    has_vis = vis_source is not None
+    # Check for multi-family geostationary sources first
+    all_families = _find_all_satellite_families()
+    multi_geo_sources: list[tuple[object, object | None, float]] = []
+    for _fam_name, (ir_src, vis_src) in sorted(all_families.items()):
+        if isinstance(ir_src, GeoSatSource):
+            multi_geo_sources.append((ir_src, vis_src, ir_src.sat_lon))
 
-    if has_ir and has_vis:
-        backing = "composite"
-    elif has_ir:
-        backing = "ir_only"
+    use_multi = len(multi_geo_sources) > 1
+
+    if use_multi:
+        # Multi-family cache key includes sorted family names
+        families_tag = "+".join(sorted(all_families.keys()))
+        cache_key = ("sat", "multi", families_tag, timestamp, z, x, y, tile_size, ext)
     else:
-        raise HTTPException(status_code=503, detail="Satellite data not available")
+        # Single-family path — same logic as before
+        ir_source, vis_source = _find_satellite_sources()
+        has_ir = ir_source is not None
+        has_vis = vis_source is not None
 
-    cache_key = ("sat", backing, timestamp, z, x, y, tile_size, ext)
+        if has_ir and has_vis:
+            backing = "composite"
+        elif has_ir:
+            backing = "ir_only"
+        else:
+            raise HTTPException(status_code=503, detail="Satellite data not available")
+
+        cache_key = ("sat", backing, timestamp, z, x, y, tile_size, ext)
+
     cached = tile_cache.get(cache_key)
     if cached is not None:
         return Response(
@@ -539,38 +592,50 @@ async def satellite_tile(
             headers={"Cache-Control": "public, max-age=300"},
         )
 
-    is_geo = isinstance(ir_source, GeoSatSource)
-
-    if is_geo:
+    if use_multi:
         tile_bytes = await asyncio.to_thread(
-            render_geo_satellite_tile,
-            ir_source=ir_source,
-            vis_source=vis_source,
+            render_multi_satellite_tile,
+            sources=multi_geo_sources,
             z=z, x=x, y=y,
-            tile_size=tile_size,
             timestamp=timestamp,
+            tile_size=tile_size,
             fmt=ext,
         )
-    elif backing == "composite":
-        tile_bytes = await asyncio.to_thread(
-            render_gmgsi_composite_tile,
-            lw_source=ir_source,
-            vis_source=vis_source,
-            z=z, x=x, y=y,
-            tile_size=tile_size,
-            timestamp=timestamp,
-            fmt=ext,
-        )
+        # Use first source's timestamps for cache-control
+        sat_timestamps = multi_geo_sources[0][0].timestamps
     else:
-        tile_bytes = await asyncio.to_thread(
-            render_gmgsi_tile,
-            source=ir_source,
-            z=z, x=x, y=y,
-            tile_size=tile_size,
-            timestamp=timestamp,
-            fmt=ext,
-        )
-    sat_timestamps = ir_source.timestamps
+        is_geo = isinstance(ir_source, GeoSatSource)
+
+        if is_geo:
+            tile_bytes = await asyncio.to_thread(
+                render_geo_satellite_tile,
+                ir_source=ir_source,
+                vis_source=vis_source,
+                z=z, x=x, y=y,
+                tile_size=tile_size,
+                timestamp=timestamp,
+                fmt=ext,
+            )
+        elif backing == "composite":
+            tile_bytes = await asyncio.to_thread(
+                render_gmgsi_composite_tile,
+                lw_source=ir_source,
+                vis_source=vis_source,
+                z=z, x=x, y=y,
+                tile_size=tile_size,
+                timestamp=timestamp,
+                fmt=ext,
+            )
+        else:
+            tile_bytes = await asyncio.to_thread(
+                render_gmgsi_tile,
+                source=ir_source,
+                z=z, x=x, y=y,
+                tile_size=tile_size,
+                timestamp=timestamp,
+                fmt=ext,
+            )
+        sat_timestamps = ir_source.timestamps
 
     tile_cache.put(cache_key, tile_bytes)
 
