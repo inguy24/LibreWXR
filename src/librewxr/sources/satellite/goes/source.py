@@ -68,11 +68,11 @@ class GOESSource(GeoSatSource):
             cmi = ds["CMI"].values
             if cmi.ndim == 3 and cmi.shape[0] == 1:
                 cmi = cmi[0]
-            if cmi.shape != (self._grid_height, self._grid_width):
+            if cmi.shape != (self._full_grid_height, self._full_grid_width):
                 logger.warning(
                     "%s: unexpected grid shape %s vs (%d, %d)",
                     self.friendly_name, cmi.shape,
-                    self._grid_height, self._grid_width,
+                    self._full_grid_height, self._full_grid_width,
                 )
                 return None
 

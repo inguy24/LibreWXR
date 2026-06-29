@@ -74,8 +74,10 @@ class GeoSatSource:
         # Per-frame grid metadata (set on first decode)
         self._x_vec: np.ndarray | None = None  # 1-D scan-angle x coords
         self._y_vec: np.ndarray | None = None  # 1-D scan-angle y coords
-        self._grid_height: int = 0
+        self._grid_height: int = 0  # post-crop/downsample (used by sample())
         self._grid_width: int = 0
+        self._full_grid_height: int = 0  # raw NetCDF dims (used by shape check)
+        self._full_grid_width: int = 0
 
         # BBOX crop indices (computed once after first grid init)
         self._crop_row_start: int = 0
@@ -279,6 +281,9 @@ class GeoSatSource:
         full_y = ds["y"].values.astype(np.float64)
         full_h = len(full_y)
         full_w = len(full_x)
+
+        self._full_grid_width = full_w
+        self._full_grid_height = full_h
 
         if self._bbox is not None and not self._crop_computed:
             self._compute_crop_indices(full_x, full_y, full_w, full_h)
@@ -538,6 +543,8 @@ class GeoSatSource:
         self._y_vec = None
         self._grid_height = 0
         self._grid_width = 0
+        self._full_grid_height = 0
+        self._full_grid_width = 0
         self._crop_row_start = 0
         self._crop_row_end = 0
         self._crop_col_start = 0
