@@ -531,6 +531,13 @@ class GeoSatSource:
                 meta_path,
                 x_vec=self._x_vec,
                 y_vec=self._y_vec,
+                crop_indices=np.array([
+                    self._crop_row_start, self._crop_row_end,
+                    self._crop_col_start, self._crop_col_end,
+                ]),
+                full_grid=np.array([self._full_grid_height, self._full_grid_width]),
+                crop_computed=np.array([1 if self._crop_computed else 0]),
+                bbox=np.array(self._bbox) if self._bbox else np.array([]),
             )
 
     def _read_cache(self, unix_ts: int) -> np.ndarray | None:
@@ -550,16 +557,43 @@ class GeoSatSource:
             return None
 
     def _load_grid_meta(self) -> bool:
-        """Load grid vectors from disk cache.  Returns True if successful."""
+        """Load grid vectors + crop state from disk cache.
+
+        Validates the cached BBOX against the current config — if the
+        operator changed the BBOX, the cache is invalidated.
+        """
         meta_path = self._meta_cache_path()
         if not meta_path.exists():
             return False
         try:
-            data = np.load(meta_path)
+            data = np.load(meta_path, allow_pickle=False)
+            cached_bbox = tuple(data["bbox"]) if len(data["bbox"]) == 4 else None
+            current_bbox = self._bbox
+            if cached_bbox != current_bbox:
+                logger.info(
+                    "%s: BBOX changed (%s → %s), invalidating cache",
+                    self.friendly_name, cached_bbox, current_bbox,
+                )
+                meta_path.unlink(missing_ok=True)
+                return False
+
             self._x_vec = data["x_vec"]
             self._y_vec = data["y_vec"]
             self._grid_width = len(self._x_vec)
             self._grid_height = len(self._y_vec)
+
+            if "crop_indices" in data and int(data["crop_computed"][0]):
+                ci = data["crop_indices"]
+                self._crop_row_start = int(ci[0])
+                self._crop_row_end = int(ci[1])
+                self._crop_col_start = int(ci[2])
+                self._crop_col_end = int(ci[3])
+                self._crop_computed = True
+            if "full_grid" in data:
+                fg = data["full_grid"]
+                self._full_grid_height = int(fg[0])
+                self._full_grid_width = int(fg[1])
+
             return True
         except Exception:
             logger.warning("%s: failed to load grid meta", self.friendly_name)
