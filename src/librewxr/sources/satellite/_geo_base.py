@@ -286,9 +286,9 @@ class GeoSatSource:
                     if scale is not None or offset is not None:
                         cmi = raw.astype(np.float32)
                         if scale is not None:
-                            cmi *= float(scale)
+                            cmi *= np.float32(scale)
                         if offset is not None:
-                            cmi += float(offset)
+                            cmi += np.float32(offset)
                     else:
                         cmi = raw.astype(np.float32)
 
