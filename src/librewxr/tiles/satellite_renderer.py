@@ -196,6 +196,125 @@ def render_geo_satellite_tile(
     return _encode_image(Image.fromarray(rgba, "RGBA"), fmt)
 
 
+def render_multi_satellite_tile(
+    sources: list[tuple[object, object | None, float]],
+    z: int,
+    x: int,
+    y: int,
+    timestamp: int,
+    tile_size: int = 256,
+    fmt: str = "png",
+) -> bytes | None:
+    """Render a composite tile from multiple geostationary satellite families.
+
+    Each entry in *sources* is ``(ir_source, vis_source_or_None, sat_lon)``
+    where ``sat_lon`` is the sub-satellite longitude in degrees.  Per-pixel
+    source selection prefers the satellite whose sub-satellite longitude is
+    closest to the pixel's longitude — a proxy for lower zenith angle and
+    therefore less atmospheric distortion.
+
+    When only one family has data at a given pixel the value is used
+    directly.  When no family has data the pixel is transparent (alpha=0).
+
+    VIS-over-IR compositing uses the same math as
+    ``render_geo_satellite_tile()``: when VIS data is available, it is
+    blended over IR using ``vis_alpha = vis_encoded / 255``.
+    """
+    lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
+
+    # Sample each source family and collect per-source data planes
+    ir_planes: list[np.ndarray] = []
+    vis_planes: list[np.ndarray | None] = []
+    sat_lons: list[float] = []
+
+    for ir_source, vis_source, sat_lon in sources:
+        ir_encoded = ir_source.sample(lat_grid, lon_grid, timestamp)
+        ir_planes.append(ir_encoded)
+        if vis_source is not None:
+            vis_planes.append(vis_source.sample(lat_grid, lon_grid, timestamp))
+        else:
+            vis_planes.append(None)
+        sat_lons.append(sat_lon)
+
+    n_sources = len(sources)
+    shape = lat_grid.shape
+
+    # Fast path: single source — identical to render_geo_satellite_tile()
+    if n_sources == 1:
+        ir_encoded = ir_planes[0]
+        vis_encoded = vis_planes[0]
+        ir_brightness = ir_encoded.astype(np.float32)
+
+        if vis_encoded is not None:
+            vis_brightness = vis_encoded.astype(np.float32)
+            vis_alpha = vis_encoded.astype(np.float32) / 255.0
+            out_brightness = vis_brightness * vis_alpha + ir_brightness * (1.0 - vis_alpha)
+            has_data = (ir_encoded > 0) | (vis_encoded > 0)
+        else:
+            out_brightness = ir_brightness
+            has_data = ir_encoded > 0
+
+        rgba = np.zeros((*shape, 4), dtype=np.uint8)
+        rgba[..., 0] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+        rgba[..., 1] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+        rgba[..., 2] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+        rgba[..., 3] = np.where(has_data, np.uint8(255), np.uint8(0))
+        return _encode_image(Image.fromarray(rgba, "RGBA"), fmt)
+
+    # Multi-source: per-pixel selection by proximity to sub-satellite longitude
+    # Build per-source composited brightness (VIS-over-IR) and has_data masks
+    src_brightness = np.zeros((n_sources, *shape), dtype=np.float32)
+    src_has_data = np.zeros((n_sources, *shape), dtype=bool)
+
+    for i in range(n_sources):
+        ir_encoded = ir_planes[i]
+        vis_encoded = vis_planes[i]
+        ir_brightness = ir_encoded.astype(np.float32)
+
+        if vis_encoded is not None:
+            vis_brightness = vis_encoded.astype(np.float32)
+            vis_alpha = vis_encoded.astype(np.float32) / 255.0
+            composited = vis_brightness * vis_alpha + ir_brightness * (1.0 - vis_alpha)
+            has_data = (ir_encoded > 0) | (vis_encoded > 0)
+        else:
+            composited = ir_brightness
+            has_data = ir_encoded > 0
+
+        src_brightness[i] = composited
+        src_has_data[i] = has_data
+
+    # Compute angular distance from each pixel's longitude to each source's
+    # sub-satellite longitude.  Use absolute difference, wrapping at ±180°.
+    lon_f64 = lon_grid.astype(np.float64)
+    best_idx = np.full(shape, -1, dtype=np.int32)
+    best_dist = np.full(shape, 999.0, dtype=np.float64)
+
+    for i, sat_lon in enumerate(sat_lons):
+        diff = np.abs(lon_f64 - sat_lon)
+        diff = np.minimum(diff, 360.0 - diff)  # wrap across antimeridian
+        # Only consider pixels where this source has data
+        candidate = src_has_data[i]
+        closer = candidate & (diff < best_dist)
+        best_idx = np.where(closer, i, best_idx)
+        best_dist = np.where(closer, diff, best_dist)
+
+    # Assemble output from the selected source per pixel
+    out_brightness = np.zeros(shape, dtype=np.float32)
+    has_any_data = best_idx >= 0
+
+    for i in range(n_sources):
+        mask = best_idx == i
+        out_brightness = np.where(mask, src_brightness[i], out_brightness)
+
+    rgba = np.zeros((*shape, 4), dtype=np.uint8)
+    rgba[..., 0] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 1] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.where(has_any_data, np.uint8(255), np.uint8(0))
+
+    return _encode_image(Image.fromarray(rgba, "RGBA"), fmt)
+
+
 def _encode_image(img: Image.Image, fmt: str) -> bytes:
     """Encode a PIL image to bytes."""
     buf = io.BytesIO()
