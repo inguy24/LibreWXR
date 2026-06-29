@@ -36,20 +36,36 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
 
     Coverage: longitude 60°E to 180°E (Japan, Korea, SE Asia, Oceania,
     eastern Africa coast, western Pacific).
+
+    When ``multi_satellite`` is True, the BBOX (not just the center) is
+    checked for overlap with the 60°E-180°E zone.  This means a station
+    centered in GOES territory but with a wide enough BBOX reaching into
+    Himawari coverage will also get Himawari contributions.
     """
     if not getattr(settings, "himawari_enabled", True):
         return []
 
     center_lon = _center_longitude(settings)
-    if center_lon is None:
-        return []
 
-    if not (60.0 <= center_lon <= 180.0):
+    # BBOX-edge-aware: when multi_satellite is True and the BBOX overlaps
+    # the 60°E-180°E Himawari coverage zone, enable Himawari even if the
+    # center is outside that zone.
+    bbox = getattr(settings, "get_bbox", lambda: None)()
+    bbox_overlaps = False
+    if getattr(settings, "multi_satellite", True) and bbox is not None:
+        _, west, _, east = bbox
+        bbox_overlaps = west < 180.0 and east > 60.0
+
+    if bbox_overlaps:
+        # BBOX overlaps Himawari coverage — proceed regardless of center
+        pass
+    elif center_lon is None:
+        return []
+    elif not (60.0 <= center_lon <= 180.0):
         return []
 
     per_source = getattr(settings, "himawari_max_frames", 0)
     retention = per_source if per_source > 0 else getattr(settings, "satellite_max_frames", 36)
-    bbox = getattr(settings, "get_bbox", lambda: None)()
     contributions: list[SatelliteContribution] = []
 
     if getattr(settings, "himawari_ir_enabled", True):
