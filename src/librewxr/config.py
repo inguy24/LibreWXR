@@ -118,6 +118,13 @@ class Settings(BaseSettings):
     himawari_enabled: bool = True
     himawari_ir_enabled: bool = True
     himawari_vis_enabled: bool = True
+    # When True (default), BBOX-edge-aware auto-selection enables
+    # multiple satellite sources when the operator's BBOX spans a
+    # satellite boundary (e.g. the -100° GOES-18/GOES-19 split, or
+    # the 60°E-180°E Himawari coverage zone).  When False, only the
+    # satellite whose footprint contains the BBOX center is enabled
+    # (original single-satellite behavior).
+    multi_satellite: bool = True
     # Keep GOES VIS Band 2 at native 0.5 km resolution.  Default False
     # downsamples to ~2 km (4x4 block average) to save memory (~3.75 MB
     # vs ~60 MB per uncropped frame).
