@@ -118,6 +118,13 @@ class Settings(BaseSettings):
     himawari_enabled: bool = True
     himawari_ir_enabled: bool = True
     himawari_vis_enabled: bool = True
+    # Keep GOES VIS Band 2 at native 0.5 km resolution.  Default False
+    # downsamples to ~2 km (4x4 block average) to save memory (~3.75 MB
+    # vs ~60 MB per uncropped frame).
+    goes_vis_hires: bool = False
+    # Per-source frame retention override.  0 = use satellite_max_frames.
+    goes_max_frames: int = 0
+    himawari_max_frames: int = 0
     # Station longitude hint for satellite source auto-selection when no
     # BBOX is configured.  When None, auto-selection falls through to
     # GMGSI for all regions.

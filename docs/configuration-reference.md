@@ -1109,6 +1109,24 @@ Per-channel toggle for GOES Band 2 (0.64 µm visible). Adds the daytime reflecte
 | **Default** | `true` |
 | **Type** | boolean |
 
+#### `LIBREWXR_GOES_VIS_HIRES`
+
+Keep GOES VIS Band 2 at native 0.5 km resolution. When `false` (default), VIS frames are downsampled to ~2 km via a 4x4 block average after decode — ~3.75 MB per uncropped frame instead of ~60 MB. Enable for maximum cloud detail at higher memory cost.
+
+| | |
+|---|---|
+| **Default** | `false` |
+| **Type** | boolean |
+
+#### `LIBREWXR_GOES_MAX_FRAMES`
+
+Per-source frame retention override for GOES. When `0` (default), uses `LIBREWXR_SATELLITE_MAX_FRAMES`. Set to a positive value to override independently.
+
+| | |
+|---|---|
+| **Default** | `0` |
+| **Type** | integer |
+
 ### Himawari-9 (Asia-Pacific)
 
 Himawari-9 AHI serves full-disk imagery at 2 km resolution, 10-minute cadence. Auto-selected for stations between 60°E and 180°E (Japan, Korea, SE Asia, Oceania, eastern Africa coast).
@@ -1139,6 +1157,15 @@ Per-channel toggle for Himawari Band 3 (0.64 µm visible).
 |---|---|
 | **Default** | `true` |
 | **Type** | boolean |
+
+#### `LIBREWXR_HIMAWARI_MAX_FRAMES`
+
+Per-source frame retention override for Himawari. When `0` (default), uses `LIBREWXR_SATELLITE_MAX_FRAMES`. Set to a positive value to override independently.
+
+| | |
+|---|---|
+| **Default** | `0` |
+| **Type** | integer |
 
 ### GMGSI (Global Fallback)
 

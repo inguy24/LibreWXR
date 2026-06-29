@@ -62,8 +62,11 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
     if not (-170.0 <= center_lon <= -30.0):
         return []
 
-    retention = getattr(settings, "satellite_max_frames", 36)
+    per_source = getattr(settings, "goes_max_frames", 0)
+    retention = per_source if per_source > 0 else getattr(settings, "satellite_max_frames", 36)
     bbox = getattr(settings, "get_bbox", lambda: None)()
+    vis_hires = getattr(settings, "goes_vis_hires", False)
+    vis_downsample = 1 if vis_hires else 4  # 0.5 km native -> 2 km default
     contributions: list[SatelliteContribution] = []
 
     if center_lon < -100.0:
@@ -84,6 +87,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
                 SatelliteContribution(
                     instance=GOES18VISSource(
                         cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                        downsample_factor=vis_downsample,
                     ),
                     priority=6,
                     name="GOES-18 VIS",
@@ -108,6 +112,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
                 SatelliteContribution(
                     instance=GOES19VISSource(
                         cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                        downsample_factor=vis_downsample,
                     ),
                     priority=6,
                     name="GOES-19 VIS",
