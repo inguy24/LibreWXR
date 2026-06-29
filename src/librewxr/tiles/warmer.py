@@ -363,9 +363,12 @@ class TileWarmer:
     async def warm_satellite(self) -> None:
         """Pre-render satellite tiles at overview zoom levels.
 
-        Iterates satellite timestamps × overview tile coordinates, renders
+        Iterates satellite timestamps x overview tile coordinates, renders
         each tile using the appropriate renderer (opaque for GeoSat, semi-
         transparent for GMGSI), and stores the result in the tile cache.
+
+        When multiple geostationary families are loaded, uses the multi-
+        satellite renderer for seamless compositing across satellite disks.
         """
         if not self._satellite_grids:
             return
@@ -375,9 +378,10 @@ class TileWarmer:
             render_geo_satellite_tile,
             render_gmgsi_composite_tile,
             render_gmgsi_tile,
+            render_multi_satellite_tile,
         )
 
-        # Find best IR and VIS sources (same logic as routes._find_satellite_sources)
+        # Index all families (same logic as routes._find_all_satellite_families)
         ir_source = None
         vis_source = None
         by_family: dict[str, dict[str, object]] = {}
@@ -394,17 +398,40 @@ class TileWarmer:
                 family = slug[: -len("_vis_grid")]
                 by_family.setdefault(family, {})["vis"] = grid
 
+        # Build multi-satellite source list for geostationary families
+        multi_geo_sources: list[tuple[object, object | None, float]] = []
+        all_family_names: list[str] = []
+        for family, channels in sorted(by_family.items()):
+            if "ir" in channels and isinstance(channels["ir"], GeoSatSource):
+                multi_geo_sources.append(
+                    (channels["ir"], channels.get("vis"), channels["ir"].sat_lon)
+                )
+                all_family_names.append(family)
+
+        use_multi = len(multi_geo_sources) > 1
+
+        # Also find single best source for fallback / single-family path
         for family, channels in by_family.items():
             if "ir" in channels:
                 ir_source = channels["ir"]
                 vis_source = channels.get("vis")
                 break
 
-        if ir_source is None:
+        if ir_source is None and not use_multi:
             return
 
-        is_geo = isinstance(ir_source, GeoSatSource)
-        timestamps = list(ir_source.timestamps)
+        if use_multi:
+            families_tag = "+".join(sorted(all_family_names))
+            logger.info("Satellite warm: multi-family mode (%s)", families_tag)
+            # Use union of all source timestamps
+            all_ts: set[int] = set()
+            for ir_src, _, _ in multi_geo_sources:
+                all_ts.update(ir_src.timestamps)
+            timestamps = sorted(all_ts)
+        else:
+            is_geo = isinstance(ir_source, GeoSatSource)
+            timestamps = list(ir_source.timestamps)
+
         if not timestamps:
             return
 
@@ -420,7 +447,6 @@ class TileWarmer:
 
         tile_size = 512
         fmt = "webp"
-        total = sum(len(tiles) for tiles in tiles_by_zoom.values()) * len(timestamps)
         submitted = 0
         skipped = 0
         start = time.monotonic()
@@ -430,13 +456,25 @@ class TileWarmer:
         for ts in timestamps:
             for z in range(max_zoom_total + 1):
                 for x, y in tiles_by_zoom[z]:
-                    backing = "composite" if vis_source is not None else "ir_only"
-                    cache_key = ("sat", backing, ts, z, x, y, tile_size, fmt)
+                    if use_multi:
+                        cache_key = ("sat", "multi", families_tag, ts, z, x, y, tile_size, fmt)
+                    else:
+                        backing = "composite" if vis_source is not None else "ir_only"
+                        cache_key = ("sat", backing, ts, z, x, y, tile_size, fmt)
                     if self._cache.get(cache_key) is not None:
                         skipped += 1
                         continue
 
-                    if is_geo:
+                    if use_multi:
+                        render_fn = render_multi_satellite_tile
+                        kwargs = dict(
+                            sources=multi_geo_sources,
+                            z=z, x=x, y=y,
+                            timestamp=ts,
+                            tile_size=tile_size,
+                            fmt=fmt,
+                        )
+                    elif is_geo:
                         render_fn = render_geo_satellite_tile
                         kwargs = dict(
                             ir_source=ir_source,
