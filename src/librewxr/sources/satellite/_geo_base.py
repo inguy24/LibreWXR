@@ -61,6 +61,7 @@ class GeoSatSource:
         cache_dir: Path | None = None,
         max_frames: int = 36,
         bbox: tuple[float, float, float, float] | None = None,
+        downsample_factor: int = 1,
     ) -> None:
         self.name = self.friendly_name
         self._frames: dict[int, np.ndarray] = {}
@@ -68,6 +69,7 @@ class GeoSatSource:
         self._fs: fsspec.AbstractFileSystem | None = None
         self._max_frames = max_frames
         self._bbox = bbox
+        self._downsample_factor = downsample_factor
 
         # Per-frame grid metadata (set on first decode)
         self._x_vec: np.ndarray | None = None  # 1-D scan-angle x coords
@@ -147,6 +149,15 @@ class GeoSatSource:
                     self._crop_row_start:self._crop_row_end,
                     self._crop_col_start:self._crop_col_end,
                 ].copy()
+            if self._downsample_factor > 1:
+                f = self._downsample_factor
+                h, w = arr.shape
+                arr = (
+                    arr[: h - h % f, : w - w % f]
+                    .reshape(h // f, f, w // f, f)
+                    .mean(axis=(1, 3))
+                    .astype(np.uint8)
+                )
             self._frames[unix_ts] = arr
             new_count += 1
             if self._channel_cache_dir is not None:
@@ -278,6 +289,10 @@ class GeoSatSource:
         else:
             self._x_vec = full_x
             self._y_vec = full_y
+        if self._downsample_factor > 1:
+            f = self._downsample_factor
+            self._x_vec = self._x_vec[f // 2 :: f]
+            self._y_vec = self._y_vec[f // 2 :: f]
         self._grid_width = len(self._x_vec)
         self._grid_height = len(self._y_vec)
 
@@ -507,6 +522,7 @@ class GeoSatSource:
             "max_frames": self._max_frames,
             "bucket": self.s3_bucket,
             "bbox": self._bbox,
+            "downsample_factor": self._downsample_factor,
         }
 
     def __setstate__(self, state: dict) -> None:
@@ -514,6 +530,7 @@ class GeoSatSource:
         self._cache_root = Path(cache_root) if cache_root else None
         self._max_frames = state.get("max_frames", 36)
         self._bbox = state.get("bbox")
+        self._downsample_factor = state.get("downsample_factor", 1)
         self._frames = {}
         self._sorted_timestamps = []
         self._fs = None

@@ -276,3 +276,108 @@ def test_pickle_round_trip(tmp_path: Path):
     render_src.__setstate__(state)
     assert render_src.timestamps == [ts]
     np.testing.assert_array_equal(render_src._frames[ts], grid)
+
+
+# ── BBOX crop ──
+
+
+class TestBBOXCrop:
+    """BBOX crop for geostationary sources."""
+
+    def test_crop_reduces_grid_dimensions(self):
+        """With a BBOX, grid should be much smaller than full CONUS."""
+        bbox = (32.0, -120.5, 35.5, -114.5)
+        src = GOES18IRSource(cache_dir=None, max_frames=3, bbox=bbox)
+        src._x_vec = np.linspace(-0.10, 0.02, 2500, dtype=np.float64)
+        src._y_vec = np.linspace(0.12, 0.04, 1500, dtype=np.float64)
+        src._grid_width = 2500
+        src._grid_height = 1500
+        src._compute_crop_indices(src._x_vec, src._y_vec, 2500, 1500)
+        assert src._crop_computed
+        crop_h = src._crop_row_end - src._crop_row_start
+        crop_w = src._crop_col_end - src._crop_col_start
+        assert crop_h < 500, f"Cropped height {crop_h} not much smaller than 1500"
+        assert crop_w < 500, f"Cropped width {crop_w} not much smaller than 2500"
+        assert crop_h > 0
+        assert crop_w > 0
+
+    def test_no_bbox_means_no_crop(self):
+        """Without BBOX, no crop should be computed."""
+        src = GOES18IRSource(cache_dir=None, max_frames=3, bbox=None)
+        assert not src._crop_computed
+
+    def test_bbox_outside_coverage_no_crop(self):
+        """BBOX entirely invisible from GOES-18 should not produce a crop."""
+        # London is not visible from GOES-18 at -137 W
+        bbox = (51.0, -0.5, 52.0, 0.5)
+        src = GOES18IRSource(cache_dir=None, max_frames=3, bbox=bbox)
+        src._compute_crop_indices(
+            np.linspace(-0.10, 0.02, 2500, dtype=np.float64),
+            np.linspace(0.12, 0.04, 1500, dtype=np.float64),
+            2500, 1500,
+        )
+        assert not src._crop_computed
+
+    def test_crop_indices_within_grid_bounds(self):
+        """Crop indices must stay within the grid dimensions."""
+        bbox = (25.0, -130.0, 50.0, -60.0)
+        src = GOES18IRSource(cache_dir=None, max_frames=3, bbox=bbox)
+        full_w, full_h = 2500, 1500
+        src._compute_crop_indices(
+            np.linspace(-0.10, 0.02, full_w, dtype=np.float64),
+            np.linspace(0.12, 0.04, full_h, dtype=np.float64),
+            full_w, full_h,
+        )
+        assert src._crop_computed
+        assert 0 <= src._crop_row_start < src._crop_row_end <= full_h
+        assert 0 <= src._crop_col_start < src._crop_col_end <= full_w
+
+    def test_sample_returns_zero_outside_cropped_bbox(self):
+        """After BBOX crop, sample() should return 0 for points outside."""
+        bbox = (32.0, -120.5, 35.5, -114.5)
+        src = GOES18IRSource(cache_dir=None, max_frames=3, bbox=bbox)
+        # Set up a full grid, then crop
+        full_x = np.linspace(-0.10, 0.02, 500, dtype=np.float64)
+        full_y = np.linspace(0.12, 0.04, 400, dtype=np.float64)
+        src._compute_crop_indices(full_x, full_y, 500, 400)
+        assert src._crop_computed
+        # Apply the crop to the vectors (as _init_grid_vectors would)
+        src._x_vec = full_x[src._crop_col_start:src._crop_col_end]
+        src._y_vec = full_y[src._crop_row_start:src._crop_row_end]
+        src._grid_width = len(src._x_vec)
+        src._grid_height = len(src._y_vec)
+        # Fill with non-zero data
+        grid = np.full((src._grid_height, src._grid_width), 200, dtype=np.uint8)
+        ts = 55555
+        src._frames[ts] = grid
+        src._sorted_timestamps = [ts]
+        # NYC is far outside the SoCal BBOX and outside the cropped grid
+        lat = np.array([[40.7]], dtype=np.float64)
+        lon = np.array([[-74.0]], dtype=np.float64)
+        out = src.sample(lat, lon, timestamp=ts)
+        assert out[0, 0] == 0
+
+
+# ── Renderer compatibility ──
+
+
+def test_goes_source_renders_via_satellite_renderer():
+    """GOES source works with the existing satellite renderer."""
+    from librewxr.tiles.satellite_renderer import render_gmgsi_tile
+
+    src = GOES18IRSource(cache_dir=None, max_frames=3)
+    src._x_vec = np.linspace(-0.10, 0.02, 100, dtype=np.float64)
+    src._y_vec = np.linspace(0.12, 0.04, 80, dtype=np.float64)
+    src._grid_width = 100
+    src._grid_height = 80
+    grid = np.full((80, 100), 150, dtype=np.uint8)
+    ts = 12345
+    src._frames[ts] = grid
+    src._sorted_timestamps = [ts]
+
+    tile_bytes = render_gmgsi_tile(
+        source=src, z=3, x=1, y=2,
+        tile_size=256, timestamp=ts, fmt="png",
+    )
+    assert len(tile_bytes) > 0
+    assert tile_bytes[:4] == b"\x89PNG"

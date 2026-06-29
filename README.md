@@ -26,7 +26,7 @@ Beyond this though, is the goal of creating a far more customizable API backend 
 - **Optical flow interpolation** — hourly ECMWF IFS frames are interpolated to 10-minute steps using dense motion vectors, so global IFS coverage animates smoothly like real radar data instead of jumping hour-to-hour (configurable, enabled by default)
 - **Precipitation nowcasting (experimental)** — 60-minute short-range forecast by extrapolating recent radar forward using optical flow, with configurable blend mode: smooth radar-to-model blending (default), pure radar extrapolation (closest to Rain Viewer), or pure NWP forecast. The model side is taken from the active NWP chain — HRRR over CONUS, ICON-EU/DINI over Europe, WRF-SMN over the S. American Cone, JMA MSM over Japan + adjacent East Asia, IFS elsewhere. Beyond 60 minutes, always uses pure model. Quality varies by weather pattern — works best for steady, organized precipitation; less reliable for fast-developing convection
 - **Precipitation motion arrows** — optional Dark Sky-style arrows showing storm movement direction and speed, derived from optical flow. Available for both radar and ECMWF data globally. Supports light and dark styles for different map themes via `?arrows=light` or `?arrows=dark` query parameter
-- **Real satellite imagery (GMGSI composite)** — NOAA's hourly global mosaic (GOES-East + GOES-West + Meteosat-9 + Meteosat-10 + Himawari-9, composited by NESDIS) ingested as longwave IR + visible channels and rendered as a VIS-over-LW composite with a natural day/night terminator crossfade. Day side shows continents and clouds as they appear from space; night side shows cold-cloud IR on a transparent basemap. Up to 12 hours of hourly animation with persistent disk caching. Populates the Rain Viewer-compatible `satellite.infrared` endpoint
+- **Real satellite imagery** — three source families auto-selected by station longitude: GOES-18/19 ABI for the Americas (2 km, 5-min cadence via `noaa-goes18`/`noaa-goes19` S3), Himawari-9 AHI for Asia-Pacific (2 km, 10-min cadence via `noaa-himawari9` S3), and NOAA GMGSI as a global fallback for uncovered regions like Europe and Africa (8 km, hourly). Station location is derived from `LIBREWXR_BBOX` center or `LIBREWXR_STATION_LON`. All sources render as a VIS-over-IR composite with a natural day/night terminator crossfade — day side shows visible reflectance, night side shows longwave IR cold-cloud tops. BBOX crop keeps only the operator's region in memory. Populates the Rain Viewer-compatible `satellite.infrared` endpoint
 - **Weather alerts (WMO CAP)** — global weather alerts polled every 5 minutes from severeweather.wmo.int, with MeteoAlarm geocodes for European polygon resolution. Surfaced through a Rain Viewer-extension alerts API (`/v2/alerts/...`). Configurable via `LIBREWXR_ALERTS_ENABLED`
 - **Snow detection** — per-pixel snow/rain classification. Regional NWP sources classify natively from their own 2-metre temperature field (HRRR-CONUS, HRRR-Alaska, WRF-SMN, DMI DINI, ICON-EU, JMA MSM); ECMWF IFS snowfall ratio fills everywhere else
 - **Noise filtering** — configurable dBZ noise floor and speckle removal
@@ -42,7 +42,7 @@ Beyond this though, is the goal of creating a far more customizable API backend 
 
 - **Limited radar coverage outside US / Canada / Europe / Central America / Taiwan / Japan / SE Asia** — real radar composites cover the US (CONUS, Alaska, Hawaii, Puerto Rico, Guam), Canada, El Salvador and its neighbours, Europe (via OPERA pan-European composite + DPC for Italy), Taiwan (CWA QPESUMS), Japan (JMA HRPN), and Malaysia + Borneo + Brunei + Singapore + N. Sumatra (MET Malaysia). Everywhere else uses the regional NWP chain on top of ECMWF IFS for the precipitation layer — that's a complete picture of global precipitation, but it's modelled output, not direct radar observation
 - **Experimental nowcasting** — precipitation nowcast uses optical flow extrapolation blended with whichever regional model is active in the active NWP chain (or ECMWF IFS where none is), which works well for steady, organized precipitation but is less reliable for fast-developing convection, cell initiation/dissipation, or complex terrain effects
-- **Satellite is hourly, not real-time** — GMGSI publishes one composite per hour with ~35 minutes of latency from observation. Native per-satellite feeds (GOES, Himawari, Meteosat) refresh every 5–15 minutes, but at the cost of seam-blending and reprojection work that GMGSI handles upstream. GMGSI also caps at ±72.7° latitude — the deep polar regions are out of frame
+- **Satellite coverage gaps** — GOES-18/19 cover the Americas (~170°W to ~30°W) and Himawari-9 covers Asia-Pacific (~60°E to ~180°E) at high resolution (2 km, 5–10 min). Regions outside both footprints (Europe, Africa, Middle East) fall back to GMGSI's global mosaic at coarser resolution (8 km, hourly, ~35 min latency). All sources cap at roughly ±72° latitude — the deep polar regions are out of frame
 
 ## Coverage
 
@@ -348,7 +348,7 @@ GET /v2/satellite/{timestamp}/{size}/{z}/{x}/{y}/0/0_0.{ext}
 | `z`, `x`, `y` | integers | Standard slippy map tile coordinates |
 | `ext` | `png`, `webp` | Image format |
 
-Returns real satellite imagery tiles backed by NOAA GMGSI. The endpoint serves a VIS-over-LW composite when both channels are loaded: the daytime side shows visible reflectance (continents, oceans, sunlit clouds) and the night side falls through to longwave IR (cold cloud tops on a transparent basemap). The terminator crossfade emerges naturally from the underlying reflectance field. Hourly cadence; global coverage between ±72.7° latitude.
+Returns real satellite imagery tiles. The active source is auto-selected by station longitude: GOES-18/19 for the Americas (2 km, 5-min), Himawari-9 for Asia-Pacific (2 km, 10-min), or GMGSI as a global fallback (8 km, hourly). All sources render a VIS-over-LW composite: the daytime side shows visible reflectance (continents, oceans, sunlit clouds) and the night side falls through to longwave IR (cold cloud tops on a transparent basemap). The terminator crossfade emerges naturally from the underlying reflectance field.
 
 #### Coverage Tiles
 
@@ -434,10 +434,12 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_NOWCAST_FRAMES` | `6` | Number of nowcast frames (6 × 10 min = 60 min forecast) |
 | `LIBREWXR_NOWCAST_BLEND_MODE` | `blended` | `radar`, `blended`, or `model`. Beyond 60 min always uses pure model |
 | **Satellite + alerts** | | |
-| `LIBREWXR_SATELLITE_ENABLED` | `true` | Master switch for the GMGSI satellite layer (LW + VIS composite) |
-| `LIBREWXR_GMGSI_LW_ENABLED` | `true` | GMGSI longwave IR channel (24/7 base of the composite) |
-| `LIBREWXR_GMGSI_VIS_ENABLED` | `true` | GMGSI visible channel (daytime overlay) |
-| `LIBREWXR_SATELLITE_MAX_FRAMES` | `12` | Hourly satellite frames per channel to keep (12 = 12 hours) |
+| `LIBREWXR_SATELLITE_ENABLED` | `true` | Master switch for the satellite layer (all sources: GOES, Himawari, GMGSI) |
+| `LIBREWXR_GOES_ENABLED` | `true` | GOES-18/19 high-resolution satellite (Americas, 2 km, 5-min). Auto-selected by station longitude |
+| `LIBREWXR_HIMAWARI_ENABLED` | `true` | Himawari-9 high-resolution satellite (Asia-Pacific, 2 km, 10-min). Auto-selected by station longitude |
+| `LIBREWXR_GMGSI_LW_ENABLED` | `true` | GMGSI longwave IR channel — global fallback (24/7 base of the composite) |
+| `LIBREWXR_GMGSI_VIS_ENABLED` | `true` | GMGSI visible channel — global fallback (daytime overlay) |
+| `LIBREWXR_SATELLITE_MAX_FRAMES` | `12` | Satellite frames per channel to keep |
 | `LIBREWXR_ALERTS_ENABLED` | `true` | Enable WMO CAP weather alerts |
 | `LIBREWXR_ALERTS_FETCH_INTERVAL` | `300` | Alerts refresh interval in seconds |
 | **Tile rendering** | | |
@@ -595,8 +597,8 @@ Tiles are served with `Cache-Control: public, max-age=300`, so any caching rever
                           └─> [Optical Flow Interp] ───┤      [Satellite Tile Renderer]
                               (hourly → 10-min)        │       (VIS-over-LW composite)
                                                        │
-[NOAA GMGSI S3] ─> [LW + VIS frames] ──> [Disk Cache] ─┤
-   (hourly global mosaic)                (atomic writes)│
+[Satellite S3]  ─> [LW + VIS frames] ──> [Disk Cache] ─┤
+   (GOES / Himawari / GMGSI)             (atomic writes)│
                                                        │
 [WMO CAP] ───────> [Alert Store] ──────────────────────┘
    (severeweather.wmo.int + MeteoAlarm geocodes)
@@ -661,7 +663,11 @@ Layered ahead of IFS via specificity-first dispatch (see the [Regional NWP chain
 
 ### Satellite
 
-- **[NOAA GMGSI](https://registry.opendata.aws/noaa-gmgsi/)** — Global Mosaic of Geostationary Satellite Imagery, composited by NESDIS from GOES-East, GOES-West, Meteosat-9, Meteosat-10, and Himawari-9. Ingested as longwave IR + visible channels and rendered as a VIS-over-LW composite with natural day/night terminator. Anonymous AWS Open Data; hourly cadence; ±72.7° latitude coverage. Persistent disk cache survives restarts.
+Auto-selected by station longitude (`LIBREWXR_BBOX` center or `LIBREWXR_STATION_LON`). All sources share the same VIS-over-IR composite renderer and populate the Rain Viewer-compatible `satellite.infrared` endpoint.
+
+- **GOES-18 / GOES-19 ABI** — high-resolution geostationary imagery for the Americas. GOES-18 (West, 137°W) covers stations west of 100°W; GOES-19 (East, 75.2°W) covers stations east of 100°W. Band 13 longwave IR (10.3 µm, 2 km) + Band 2 visible (0.64 µm, 2 km). 5-minute cadence. Anonymous AWS Open Data (`noaa-goes18` / `noaa-goes19` S3 buckets). BBOX crop stores only the operator's region in memory. Priority 5/6 (wins over GMGSI).
+- **Himawari-9 AHI** — high-resolution geostationary imagery for Asia-Pacific (stations between 60°E and 180°E). Band 13 longwave IR (10.4 µm, 2 km) + Band 3 visible (0.64 µm, 1 km). 10-minute cadence. Anonymous AWS Open Data (`noaa-himawari9` S3 bucket). BBOX crop supported. Priority 5/6.
+- **[NOAA GMGSI](https://registry.opendata.aws/noaa-gmgsi/)** — Global Mosaic of Geostationary Satellite Imagery, composited by NESDIS from GOES-East, GOES-West, Meteosat-9, Meteosat-10, and Himawari-9. Global fallback for regions outside GOES and Himawari coverage (Europe, Africa, Middle East). Longwave IR + visible channels. Anonymous AWS Open Data; hourly cadence; ±72.7° latitude coverage. Priority 10/11. Persistent disk cache survives restarts.
 
 ### Weather alerts
 

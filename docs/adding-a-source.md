@@ -1,6 +1,6 @@
 # Adding a New Source
 
-This guide walks through adding a radar composite or regional NWP grid to LibreWXR. By the end, your source will be auto-discovered at startup, dispatched to by `RadarFetcher`, blended into the NWP chain, contribute to the coverage map, and need zero edits to `data/fetcher.py`, `data/regions.py`, or `data/coverage.py`.
+This guide walks through adding a radar composite, regional NWP grid, or satellite source to LibreWXR. By the end, your source will be auto-discovered at startup, dispatched to by `RadarFetcher` (radar), blended into the NWP chain (NWP), or wired into the satellite renderer (satellite), and need zero edits to `data/fetcher.py`, `data/regions.py`, or `data/coverage.py`.
 
 If you're looking for the short procedural checklist instead of the full walkthrough, see the **"Adding a New Source"** section in [`CLAUDE.md`](../CLAUDE.md) at the project root.
 
@@ -29,6 +29,17 @@ Self-hosters running their own LibreWXR instance are free to integrate any sourc
 - [Coverage map](#coverage-map)
 - [Tests](#tests)
 - [Final checklist](#final-checklist)
+- [Adding a satellite source](#adding-a-satellite-source)
+  - [Directory layout (satellite)](#directory-layout-1)
+  - [`source.py` (satellite)](#sourcepy-1)
+  - [`__init__.py` (the provider, satellite)](#__init__py-the-provider-2)
+  - [`SatelliteContribution` fields](#satellitecontribution-fields)
+  - [Priority ordering (satellite)](#priority-ordering)
+  - [BBOX crop](#bbox-crop)
+  - [Auto-selection by operator location](#auto-selection-by-operator-location)
+  - [Config additions (satellite)](#config-additions-1)
+  - [Renderer compatibility](#renderer-compatibility)
+  - [Final checklist (satellite-specific)](#final-checklist-satellite-specific)
 
 ## Upstream contribution criteria
 
@@ -396,3 +407,177 @@ Before opening a PR:
 - [ ] Smoke-run the server (`python -m librewxr.main`) once and confirm the new source shows up in the startup logs.
 
 That's it — no `data/fetcher.py`, `data/regions.py`, or `data/coverage.py` edits required. The discovery walker handles registration and the providers do the rest.
+
+## Adding a satellite source
+
+Satellite sources live under `sources/satellite/<name>/` and follow the same auto-discovery pattern as radar and NWP: the discovery walker in `sources/__init__.py` imports every package under `sources/satellite/`, calls its `satellite_provider(settings, cache_dir)` function, and flattens the returned list of `SatelliteContribution` objects into the global satellite registry.
+
+### Directory layout
+
+```
+sources/
+  satellite/
+    <name>/
+      __init__.py     # exports satellite_provider()
+      source.py       # SatelliteSource implementation(s)
+      README.md       # operator notes, licensing, attribution
+```
+
+No `regions.py` or `stations.py` — satellite sources don't feed the radar coverage-mask builder.
+
+### `source.py`
+
+Your source class must satisfy the `SatelliteSource` Protocol in `sources/_base.py`:
+
+- `name: str` — display name (e.g. `"GOES-18 IR"`)
+- `timestamps: list[int]` — sorted Unix-epoch list of loaded frames
+- `loaded: bool` — `True` when at least one frame is available
+- `data_bytes: int` — total memory across all frames (surfaced via `/health`)
+- `async fetch() -> bool` — ingest new frames from upstream; return `True` if new data arrived
+- `sample(lat: ndarray, lon: ndarray, timestamp: int | None) -> ndarray` — nearest-neighbour lookup into the stored grid; returns `uint8` array shaped like `lat`/`lon`; **0 = no data** (pixel not visible to the sensor, outside grid bounds, or no frame loaded)
+- `async close() -> None` — cleanup
+- `__getstate__` / `__setstate__` — pickle support for multi-worker snapshot (same memmap-reload pattern as GMGSI)
+
+The `sample()` contract:
+
+- **Inputs:** `lat` and `lon` are `float64` ndarrays of identical shape (tile pixel grids from the renderer).
+- **Output:** `uint8` ndarray of the same shape. Values are sensor-specific encoded brightness (IR channels map brightness temperature to 0–255; VIS channels map reflectance factor to 0–255). `0` means no data — the renderer treats it as transparent.
+- **Projection:** the source handles its own projection internally. For equirectangular grids (GMGSI), this is direct array indexing. For geostationary sources (GOES, Himawari), it's a forward lat/lon → scan-angle transform followed by nearest-neighbour grid lookup (see `tiles/geostationary.py` and `sources/satellite/_geo_base.py`).
+
+For geostationary satellites, inherit from `GeoSatSource` in `sources/satellite/_geo_base.py`. It handles S3 listing, frame retention, geostationary projection, BBOX crop, disk caching, and multi-worker serialization. Subclasses pin satellite-specific class variables (`sat_lon`, `sat_height`, `s3_bucket`, `s3_product_path`, `s3_filename_token`, `friendly_name`, `channel`, `cadence_minutes`) and override `_decode_netcdf()` for sensor-specific value mapping.
+
+### `__init__.py` (the provider)
+
+The package-level `satellite_provider(settings, cache_dir)` returns a list of `SatelliteContribution` objects — one per channel (e.g. IR and VIS). Return `[]` when the source doesn't apply (wrong region, disabled by config).
+
+```python
+# sources/satellite/<name>/__init__.py
+from librewxr.sources._base import SatelliteContribution
+
+from .source import MyIRSource, MyVISSource
+
+__all__ = ["MyIRSource", "MyVISSource", "satellite_provider"]
+
+
+def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
+    if not getattr(settings, "my_sat_enabled", True):
+        return []
+
+    # Check operator location — return [] when outside coverage
+    center_lon = _center_longitude(settings)
+    if center_lon is None or not _in_coverage(center_lon):
+        return []
+
+    retention = getattr(settings, "satellite_max_frames", 36)
+    bbox = getattr(settings, "get_bbox", lambda: None)()
+    contributions: list[SatelliteContribution] = []
+
+    if getattr(settings, "my_sat_ir_enabled", True):
+        contributions.append(
+            SatelliteContribution(
+                instance=MyIRSource(
+                    cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                ),
+                priority=5,
+                name="MySat IR",
+                slug="mysat_ir_grid",
+            ),
+        )
+
+    if getattr(settings, "my_sat_vis_enabled", True):
+        contributions.append(
+            SatelliteContribution(
+                instance=MyVISSource(
+                    cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                ),
+                priority=6,
+                name="MySat VIS",
+                slug="mysat_vis_grid",
+            ),
+        )
+
+    return contributions
+```
+
+### `SatelliteContribution` fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `instance` | `SatelliteSource` | The source object (IR or VIS channel) |
+| `priority` | `int` | Lower number = higher priority. When multiple sources cover the same pixel, the lower-priority source wins |
+| `name` | `str` | Display name for logs and `/health` |
+| `slug` | `str \| None` | Explicit key for the `/health` and state.json snapshot. Leave `None` to auto-derive from `name` |
+
+### Priority ordering
+
+Priority controls which source wins when multiple satellite providers return contributions for the same deployment. The renderer walks contributions by priority (lower first) and uses the first source that has data for a given pixel.
+
+Current assignments:
+
+| Source | IR Priority | VIS Priority | Notes |
+|--------|------------|-------------|-------|
+| GOES-18/19 | 5 | 6 | High-res regional, Americas |
+| Himawari-9 | 5 | 6 | High-res regional, Asia-Pacific |
+| GMGSI | 10 | 11 | Global fallback |
+
+GOES and Himawari share priority 5/6 because their coverage zones don't overlap — auto-selection ensures only one returns contributions for a given station. Pick a priority below 10 for any new high-resolution regional source; GMGSI at 10/11 is the global catch-all.
+
+### BBOX crop
+
+Sources should accept a `bbox` parameter (a `(north, west, south, east)` tuple or `None`) and crop their stored grids to reduce memory. The `GeoSatSource` base class handles this automatically for geostationary sources — it converts the BBOX corners to scan-angle space, computes pixel-index bounds, and slices every frame after decode. For non-geostationary sources (equirectangular grids like GMGSI), implement cropping in the source's `_decode` path.
+
+### Auto-selection by operator location
+
+Each satellite provider should check the operator's location and return `[]` when outside its coverage zone. The standard pattern reads the BBOX center or `LIBREWXR_STATION_LON`:
+
+```python
+def _center_longitude(settings) -> float | None:
+    bbox = getattr(settings, "get_bbox", lambda: None)()
+    if bbox is not None:
+        _, west, _, east = bbox
+        return (west + east) / 2.0
+
+    station_lon = getattr(settings, "station_lon", None)
+    if station_lon is not None:
+        return float(station_lon)
+
+    return None
+```
+
+This way, when no regional source covers the station, all regional providers return `[]` and GMGSI takes over as the global fallback. The discovery walker handles this gracefully — an empty list is the same as "not applicable."
+
+### Config additions
+
+Add your source's toggle to `config.py` alongside the existing satellite settings, and mirror it in `.env.example`:
+
+```python
+# config.py
+class Settings(BaseSettings):
+    ...
+    my_sat_enabled: bool = True
+    my_sat_ir_enabled: bool = True
+    my_sat_vis_enabled: bool = True
+```
+
+### Renderer compatibility
+
+The satellite tile renderer in `tiles/satellite_renderer.py` is source-agnostic — it calls `source.sample(lat, lon, timestamp)` and composites the VIS-over-IR result. No per-source changes to the renderer are needed as long as:
+
+1. IR channels map brightness temperature to uint8 using a consistent scale (cold cloud tops = high values, warm ground = low values, matching GMGSI's encoding).
+2. VIS channels map reflectance to uint8 (0 = dark/night, 255 = bright).
+3. `sample()` returns 0 for no-data pixels.
+
+If your source's native value range differs from GMGSI's encoding (e.g. GOES CMI returns Kelvin float32), map to uint8 in `_decode_netcdf()` before storing the frame.
+
+### Final checklist (satellite-specific)
+
+- [ ] Package directory exists under `sources/satellite/<name>/`.
+- [ ] `__init__.py` exports a `satellite_provider(settings, cache_dir) -> list[SatelliteContribution]`.
+- [ ] Source class satisfies the `SatelliteSource` Protocol (`name`, `timestamps`, `loaded`, `data_bytes`, `fetch()`, `sample()`, `close()`, `__getstate__`/`__setstate__`).
+- [ ] `sample()` returns uint8, 0 = no data, same shape as input lat/lon arrays.
+- [ ] Auto-selection returns `[]` when the station is outside coverage.
+- [ ] BBOX crop is supported (accepts `bbox` parameter, crops stored grids).
+- [ ] Config toggles added to `config.py` and `.env.example`.
+- [ ] License + attribution documented in the package's `README.md`.
+- [ ] `pytest` clean.
+- [ ] Smoke-run confirms the source appears in startup logs and `/health`.

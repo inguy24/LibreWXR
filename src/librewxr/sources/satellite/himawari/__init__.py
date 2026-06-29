@@ -47,7 +47,8 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
     if not (60.0 <= center_lon <= 180.0):
         return []
 
-    retention = getattr(settings, "satellite_max_frames", 36)
+    per_source = getattr(settings, "himawari_max_frames", 0)
+    retention = per_source if per_source > 0 else getattr(settings, "satellite_max_frames", 36)
     bbox = getattr(settings, "get_bbox", lambda: None)()
     contributions: list[SatelliteContribution] = []
 
