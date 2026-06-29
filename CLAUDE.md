@@ -78,11 +78,11 @@ src/librewxr/
     retry.py         # Backoff helper
   tiles/
     renderer.py      # On-demand tile rendering
-    satellite_renderer.py  # VIS-over-IR composite tiles (works with any satellite source)
+    satellite_renderer.py  # Satellite tile renderers: GMGSI semi-transparent RGBA (render_gmgsi_tile/render_gmgsi_composite_tile) for legacy overlay, and opaque GeoSat renderer (render_geo_satellite_tile) for GOES/Himawari (alpha=255 for data, alpha=0 for no-data). Route dispatch via isinstance(source, GeoSatSource) in routes.py
     geostationary.py # Geostationary fixed-grid ↔ lat/lon projection (GOES/Himawari)
     cache.py         # Byte-capped LRU tile cache
     coordinates.py   # Tile/region coordinate transforms
-    warmer.py        # Background tile pre-rendering
+    warmer.py        # Background tile pre-rendering (radar + satellite). warm_satellite() pre-renders satellite tiles after each ingest cycle using the same renderer dispatch as routes.py
   colors/
     schemes.py       # Color scheme definitions
 ```
@@ -117,7 +117,7 @@ Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. Markers are defined in 
 - **ECMWF IFS:** 9km global precipitation from Open-Meteo S3; optical flow interpolation for 10-min frames; reference_time skip avoids redundant downloads
 - **Nowcasting:** Radar extrapolation + IFS blending with spatial feathering at radar boundaries
 - **Satellite:** Three source families, auto-selected by station longitude: GOES-18/19 ABI (Americas, 2 km, 5-min via `noaa-goes18`/`noaa-goes19` S3), Himawari-9 AHI (Asia-Pacific, 2 km, 10-min via `noaa-himawari9` S3), GMGSI (global fallback, 8 km, hourly via `noaa-gmgsi-pds` S3). All use the same VIS-over-IR composite renderer at `/v2/satellite/...`. GOES/Himawari use geostationary fixed-grid projection (`tiles/geostationary.py`); GMGSI is pre-composited equirectangular (Mercator-spaced rows). Auto-selection in each provider's `satellite_provider()` checks `LIBREWXR_BBOX` center or `LIBREWXR_STATION_LON`; GMGSI stays as global fallback. `LIBREWXR_SATELLITE_ENABLED=false` returns 503 + empty `satellite.infrared` array
-- **Memory management:** Radar frames, ECMWF grids, and nowcast data use numpy memmap (temp files); radar fetcher skips timestamps already in store
+- **Memory management:** Radar frames, ECMWF grids, and nowcast data use numpy memmap (temp files); radar fetcher skips timestamps already in store. Docker image uses jemalloc (`LD_PRELOAD`) instead of glibc malloc — jemalloc's per-size-class arenas handle fragmentation from numpy array churn dramatically better, reducing steady-state RSS by 30-50%. `release_memory()` in `memory.py` calls `gc.collect()` after heavy operations.
 - **MRMS:** Region-aware — separate `MRMSSource` per product path (CONUS, ALASKA, HAWAII, CARIB, GUAM); directory listing with bisect for archive lookups; gzip retry + eccodes stderr suppression
 - **MARN/SNET (El Salvador):** Single S-band radar at San Andrés, 120 km product (`esar82/Images/`) from anonymous GCS bucket `radar-images-sv`; 5-min cadence; filename embeds local time (UTC-6, no DST); decoder maps HSV-style continuous hue gradient (green→cyan→blue→magenta) to dBZ; bucket archive depth ~24 h; MARN license requires citation
 - **CWA (Taiwan):** 7-radar QPESUMS composite (`O-A0059-001` / 雷達合成回波) from anonymous AWS S3 bucket `cwaopendata` in `ap-northeast-1`; 10-min cadence; archive key uses UTC+8 timestamp with no separator dot (`{YYYYMMDDHHMM}compref_mosaic.xml`); XML format with raw dBZ as comma-separated scientific-notation floats; data is row-major south-to-north → vertical flip on decode; sentinels `-99`/`-999`; OGDL v1.0 license, attribution required
