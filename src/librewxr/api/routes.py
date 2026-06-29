@@ -32,7 +32,9 @@ from librewxr.tiles.renderer import (
     render_coverage_tile,
 )
 from librewxr.tiles.request_tracker import TileRequestTracker
+from librewxr.sources.satellite._geo_base import GeoSatSource
 from librewxr.tiles.satellite_renderer import (
+    render_geo_satellite_tile,
     render_gmgsi_composite_tile,
     render_gmgsi_tile,
 )
@@ -537,7 +539,19 @@ async def satellite_tile(
             headers={"Cache-Control": "public, max-age=300"},
         )
 
-    if backing == "composite":
+    is_geo = isinstance(ir_source, GeoSatSource)
+
+    if is_geo:
+        tile_bytes = await asyncio.to_thread(
+            render_geo_satellite_tile,
+            ir_source=ir_source,
+            vis_source=vis_source,
+            z=z, x=x, y=y,
+            tile_size=tile_size,
+            timestamp=timestamp,
+            fmt=ext,
+        )
+    elif backing == "composite":
         tile_bytes = await asyncio.to_thread(
             render_gmgsi_composite_tile,
             lw_source=ir_source,

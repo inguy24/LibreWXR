@@ -21,8 +21,8 @@ _DISK_EDGE_FEATHER_DEGREES = 2.0
 # this (encoded > threshold) are treated as cloud and rendered opaque;
 # warmer pixels (ground / ocean / low cloud) ramp to fully transparent.
 # Roughly 270 K on GMGSI's 0–255 brightness-temperature scale.
-_LW_CLOUD_THRESHOLD = 30.0
-_LW_CLOUD_MAX = 200.0
+_LW_CLOUD_THRESHOLD = 25.0
+_LW_CLOUD_MAX = 140.0
 
 
 def _lw_brightness_and_alpha(
@@ -147,6 +147,53 @@ def render_gmgsi_composite_tile(
     rgba = _pack_rgba(out_brightness, out_alpha)
     img = Image.fromarray(rgba, "RGBA")
     return _encode_image(img, fmt)
+
+
+def render_geo_satellite_tile(
+    ir_source,
+    vis_source,    # can be None (IR-only mode)
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+    timestamp: int | None = None,
+    fmt: str = "png",
+) -> bytes:
+    """Render an opaque satellite tile for geostationary sources (GOES, Himawari).
+
+    Unlike the GMGSI renderers, this produces fully opaque tiles: pixels with
+    data receive alpha=255 and pixels outside the satellite disk (no-data) receive
+    alpha=0.  No disk-edge feathering is applied — the no-data mask already marks
+    the GOES/Himawari disk boundary cleanly.  Imagery is grayscale (R=G=B), with
+    no blue tint.
+
+    When ``vis_source`` is provided, VIS is composited over IR using the same
+    VIS-over-IR alpha math as the GMGSI composite renderer.  When ``vis_source``
+    is ``None``, IR brightness is used directly.
+    """
+    lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
+
+    ir_encoded = ir_source.sample(lat_grid, lon_grid, timestamp)
+
+    ir_brightness = ir_encoded.astype(np.float32)
+
+    if vis_source is not None:
+        vis_encoded = vis_source.sample(lat_grid, lon_grid, timestamp)
+        vis_brightness = vis_encoded.astype(np.float32)
+        vis_alpha = vis_encoded.astype(np.float32) / 255.0
+        out_brightness = vis_brightness * vis_alpha + ir_brightness * (1.0 - vis_alpha)
+        has_data = (ir_encoded > 0) | (vis_encoded > 0)
+    else:
+        out_brightness = ir_brightness
+        has_data = ir_encoded > 0
+
+    rgba = np.zeros((*out_brightness.shape, 4), dtype=np.uint8)
+    rgba[..., 0] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 1] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.where(has_data, np.uint8(255), np.uint8(0))
+
+    return _encode_image(Image.fromarray(rgba, "RGBA"), fmt)
 
 
 def _encode_image(img: Image.Image, fmt: str) -> bytes:
