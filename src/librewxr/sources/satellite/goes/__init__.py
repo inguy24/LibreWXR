@@ -65,14 +65,6 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
     per_source = getattr(settings, "goes_max_frames", 0)
     retention = per_source if per_source > 0 else getattr(settings, "satellite_max_frames", 36)
     bbox = getattr(settings, "get_bbox", lambda: None)()
-    if bbox is not None:
-        south, west, north, east = bbox
-        lat_span = north - south
-        lon_span = east - west
-        bbox = (
-            south - lat_span / 2, west - lon_span / 2,
-            north + lat_span / 2, east + lon_span / 2,
-        )
     vis_hires = getattr(settings, "goes_vis_hires", False)
     vis_downsample = 1 if vis_hires else 4  # 0.5 km native -> 2 km default
     contributions: list[SatelliteContribution] = []
