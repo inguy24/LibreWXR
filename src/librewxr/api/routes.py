@@ -462,25 +462,32 @@ async def coverage_tile(
 def _find_satellite_sources() -> tuple[object | None, object | None]:
     """Find the best-loaded IR and VIS satellite sources.
 
-    Iterates ``satellite_grids`` by slug, picks the highest-priority
-    (lowest priority number) loaded IR and VIS sources.  Slugs ending
-    in ``_ir_grid`` or ``_lw_grid`` are IR; ``_vis_grid`` are VIS.
-    This dispatches to GOES, Himawari, or GMGSI transparently.
+    Pairs IR and VIS from the same source family — never mixes
+    GOES IR with GMGSI VIS.  The family prefix is everything before
+    the last ``_ir_grid`` / ``_lw_grid`` / ``_vis_grid`` suffix.
     """
     if not satellite_grids:
         return None, None
-    ir_source = None
-    vis_source = None
+
+    by_family: dict[str, dict[str, object]] = {}
     for slug, grid in satellite_grids.items():
         if grid is None or not bool(grid.timestamps):
             continue
-        if slug.endswith("_ir_grid") or slug.endswith("_lw_grid"):
-            if ir_source is None:
-                ir_source = grid
+        if slug.endswith("_ir_grid"):
+            family = slug[: -len("_ir_grid")]
+            by_family.setdefault(family, {})["ir"] = grid
+        elif slug.endswith("_lw_grid"):
+            family = slug[: -len("_lw_grid")]
+            by_family.setdefault(family, {})["ir"] = grid
         elif slug.endswith("_vis_grid"):
-            if vis_source is None:
-                vis_source = grid
-    return ir_source, vis_source
+            family = slug[: -len("_vis_grid")]
+            by_family.setdefault(family, {})["vis"] = grid
+
+    for family, channels in by_family.items():
+        if "ir" in channels:
+            return channels["ir"], channels.get("vis")
+
+    return None, None
 
 
 @router.get("/v2/satellite/{timestamp}/{size}/{z}/{x}/{y}/0/0_0.{ext}")
