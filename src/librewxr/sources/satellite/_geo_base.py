@@ -248,6 +248,8 @@ class GeoSatSource:
     def _download_and_decode(
         self, fs: fsspec.AbstractFileSystem, s3_key: str,
     ) -> np.ndarray | None:
+        if self._crop_computed and self._x_vec is not None:
+            return self._stream_cropped(fs, s3_key)
         try:
             with tempfile.NamedTemporaryFile(suffix=".nc") as tmp:
                 fs.get(s3_key, tmp.name)
@@ -255,6 +257,49 @@ class GeoSatSource:
         except Exception:
             logger.exception(
                 "%s: download/decode failed for %s", self.friendly_name, s3_key,
+            )
+            return None
+
+    def _stream_cropped(
+        self, fs: fsspec.AbstractFileSystem, s3_key: str,
+    ) -> np.ndarray | None:
+        """Stream only the BBOX region from S3 via HDF5 chunked reads.
+
+        After the first frame establishes grid vectors and crop indices,
+        subsequent frames use h5py to read only the cropped slice
+        directly from S3.  Only the HDF5 chunks that intersect the
+        BBOX are downloaded — typically 2-5% of the full file.
+        """
+        import h5py
+
+        try:
+            with fs.open(s3_key, "rb") as f:
+                with h5py.File(f, "r") as hf:
+                    rs = self._crop_row_start
+                    re = self._crop_row_end
+                    cs = self._crop_col_start
+                    ce = self._crop_col_end
+
+                    raw = hf["CMI"][rs:re, cs:ce]
+                    scale = hf["CMI"].attrs.get("scale_factor", None)
+                    offset = hf["CMI"].attrs.get("add_offset", None)
+                    if scale is not None or offset is not None:
+                        cmi = raw.astype(np.float32)
+                        if scale is not None:
+                            cmi *= float(scale)
+                        if offset is not None:
+                            cmi += float(offset)
+                    else:
+                        cmi = raw.astype(np.float32)
+
+                    if "DQF" in hf:
+                        dqf = hf["DQF"][rs:re, cs:ce]
+                        cmi = np.where(dqf == 0, cmi, np.nan)
+
+                    return self._map_to_uint8(cmi)
+        except Exception:
+            logger.exception(
+                "%s: stream/decode failed for %s", self.friendly_name, s3_key,
             )
             return None
 
