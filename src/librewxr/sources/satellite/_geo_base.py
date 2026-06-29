@@ -517,7 +517,7 @@ class GeoSatSource:
         tmp = final.with_suffix(".dat.tmp")
         mm = np.memmap(
             tmp, dtype=np.uint8, mode="w+",
-            shape=(self._grid_height, self._grid_width),
+            shape=arr.shape,
         )
         mm[:] = arr
         mm.flush()
