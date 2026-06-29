@@ -426,6 +426,7 @@ async def lifespan(app: FastAPI):
         nowcast_store=nowcast_store,
         ecmwf_grid=ecmwf_grid,
         nwp_chain=nwp_chain,
+        satellite_grids=satellite_grids_by_slug,
     )
 
     # Memory pressure monitor

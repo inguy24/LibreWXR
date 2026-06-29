@@ -398,6 +398,8 @@ class RadarFetcher:
         release_memory()
         if new_frames:
             await self._fire_cycle_complete()
+            if self._warmer is not None:
+                asyncio.create_task(self._warmer.warm_satellite())
 
     async def _fetch_all_frames(self) -> None:
         """Fetch frames for all enabled regions to fill the store.
