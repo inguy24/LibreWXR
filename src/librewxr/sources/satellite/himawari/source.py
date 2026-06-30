@@ -39,7 +39,7 @@ HIMAWARI_HEIGHT = 35785831.0  # metres above ellipsoid
 
 # Same IR temperature range as GOES for consistent rendering.
 _IR_T_MIN = 170.0
-_IR_T_MAX = 320.0
+_IR_T_MAX = 340.0
 _IR_RANGE = _IR_T_MAX - _IR_T_MIN
 
 
