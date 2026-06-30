@@ -639,13 +639,25 @@ async def satellite_tile(
 
     tile_cache.put(cache_key, tile_bytes)
 
+    if tile_warmer is not None:
+        asyncio.ensure_future(
+            tile_warmer.warm_satellite_demand(
+                triggered_timestamp=timestamp,
+                z=z, x=x, y=y,
+                tile_size=tile_size,
+                fmt=ext,
+            )
+        )
+
     latest_sat_ts = max(sat_timestamps) if sat_timestamps else None
-    max_age = 7200 if (latest_sat_ts is not None and timestamp < latest_sat_ts) else 300
+    is_past = latest_sat_ts is not None and timestamp < latest_sat_ts
+    max_age = 31536000 if is_past else 300
+    cache_control = f"public, max-age={max_age}, immutable" if is_past else f"public, max-age={max_age}"
 
     return Response(
         content=tile_bytes,
         media_type=_content_type(ext),
-        headers={"Cache-Control": f"public, max-age={max_age}"},
+        headers={"Cache-Control": cache_control},
     )
 
 

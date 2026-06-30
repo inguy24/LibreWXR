@@ -360,6 +360,156 @@ class TileWarmer:
         if frame_type in ("nowcast", "both"):
             self._nowcast_warm_complete = True
 
+    async def warm_satellite_demand(
+        self,
+        triggered_timestamp: int,
+        z: int,
+        x: int,
+        y: int,
+        tile_size: int,
+        fmt: str,
+    ) -> None:
+        """Pre-render satellite tiles at (z,x,y) for all other timestamps.
+
+        Triggered on satellite tile cache miss — same demand-driven pattern
+        as warm() for radar tiles.
+        """
+        if not self._satellite_grids:
+            return
+
+        from librewxr.sources.satellite._geo_base import GeoSatSource
+        from librewxr.tiles.satellite_renderer import (
+            render_geo_satellite_tile,
+            render_gmgsi_composite_tile,
+            render_gmgsi_tile,
+            render_multi_satellite_tile,
+        )
+
+        # Build source index — same logic as warm_satellite()
+        by_family: dict[str, dict[str, object]] = {}
+        for slug, grid in self._satellite_grids.items():
+            if grid is None or not bool(grid.timestamps):
+                continue
+            if slug.endswith("_ir_grid") or slug.endswith("_lw_grid"):
+                if slug.endswith("_ir_grid"):
+                    family = slug[: -len("_ir_grid")]
+                else:
+                    family = slug[: -len("_lw_grid")]
+                by_family.setdefault(family, {})["ir"] = grid
+            elif slug.endswith("_vis_grid"):
+                family = slug[: -len("_vis_grid")]
+                by_family.setdefault(family, {})["vis"] = grid
+
+        multi_geo_sources: list[tuple[object, object | None, float]] = []
+        all_family_names: list[str] = []
+        for family, channels in sorted(by_family.items()):
+            if "ir" in channels and isinstance(channels["ir"], GeoSatSource):
+                multi_geo_sources.append(
+                    (channels["ir"], channels.get("vis"), channels["ir"].sat_lon)
+                )
+                all_family_names.append(family)
+
+        use_multi = len(multi_geo_sources) > 1
+
+        ir_source = None
+        vis_source = None
+        is_geo = False
+        for family, channels in by_family.items():
+            if "ir" in channels:
+                ir_source = channels["ir"]
+                vis_source = channels.get("vis")
+                is_geo = isinstance(ir_source, GeoSatSource)
+                break
+
+        if ir_source is None and not use_multi:
+            return
+
+        if use_multi:
+            families_tag = "+".join(sorted(all_family_names))
+            all_ts: set[int] = set()
+            for ir_src, _, _ in multi_geo_sources:
+                all_ts.update(ir_src.timestamps)
+            timestamps = sorted(all_ts)
+        else:
+            timestamps = list(ir_source.timestamps)
+
+        if not timestamps:
+            return
+
+        loop = asyncio.get_running_loop()
+        submitted = 0
+
+        for ts in timestamps:
+            if ts == triggered_timestamp:
+                continue
+
+            if use_multi:
+                cache_key = ("sat", "multi", families_tag, ts, z, x, y, tile_size, fmt)
+            else:
+                backing = "composite" if vis_source is not None else "ir_only"
+                cache_key = ("sat", backing, ts, z, x, y, tile_size, fmt)
+
+            if self._cache.get(cache_key) is not None:
+                continue
+
+            if use_multi:
+                render_fn = render_multi_satellite_tile
+                kwargs = dict(
+                    sources=multi_geo_sources,
+                    z=z, x=x, y=y,
+                    timestamp=ts,
+                    tile_size=tile_size,
+                    fmt=fmt,
+                )
+            elif is_geo:
+                render_fn = render_geo_satellite_tile
+                kwargs = dict(
+                    ir_source=ir_source,
+                    vis_source=vis_source,
+                    z=z, x=x, y=y,
+                    tile_size=tile_size,
+                    timestamp=ts,
+                    fmt=fmt,
+                )
+            elif vis_source is not None:
+                render_fn = render_gmgsi_composite_tile
+                kwargs = dict(
+                    lw_source=ir_source,
+                    vis_source=vis_source,
+                    z=z, x=x, y=y,
+                    tile_size=tile_size,
+                    timestamp=ts,
+                    fmt=fmt,
+                )
+            else:
+                render_fn = render_gmgsi_tile
+                kwargs = dict(
+                    source=ir_source,
+                    z=z, x=x, y=y,
+                    tile_size=tile_size,
+                    timestamp=ts,
+                    fmt=fmt,
+                )
+
+            try:
+                tile_bytes = await loop.run_in_executor(
+                    self._executor,
+                    lambda fn=render_fn, kw=kwargs: fn(**kw),
+                )
+                self._cache.put(cache_key, tile_bytes)
+                submitted += 1
+            except Exception:
+                logger.debug(
+                    "Satellite demand warm failed for z=%d x=%d y=%d ts=%d", z, x, y, ts
+                )
+
+            await asyncio.sleep(0)
+
+        logger.debug(
+            "Satellite demand warm complete: z=%d x=%d y=%d triggered_ts=%d, %d submitted",
+            z, x, y, triggered_timestamp, submitted,
+        )
+
     async def warm_satellite(self) -> None:
         """Pre-render satellite tiles at overview zoom levels.
 
