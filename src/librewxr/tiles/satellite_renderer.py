@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
 import io
+import logging
 
 import numpy as np
 from PIL import Image
@@ -9,6 +10,8 @@ from librewxr.config import settings
 from librewxr.sources.satellite.gmgsi.source import LAT_MAX as _GMGSI_LAT_MAX
 from librewxr.sources.satellite.gmgsi.source import LAT_MIN as _GMGSI_LAT_MIN
 from librewxr.tiles.coordinates import tile_pixel_latlons
+
+logger = logging.getLogger(__name__)
 
 # Smoothstep alpha attenuation across the last few degrees of GMGSI
 # disk coverage so the ±72.7° horizontal cutoffs fade into the basemap
@@ -237,15 +240,25 @@ def render_multi_satellite_tile(
     # Pick the closest source whose scan grid covers the tile center
     chosen_ir = None
     chosen_vis = None
+    chosen_lon = None
     for _idx, (ir_source, vis_source, _sat_lon) in ranked:
         if _source_covers_point(ir_source, center_lat, center_lon):
             chosen_ir = ir_source
             chosen_vis = vis_source
+            chosen_lon = _sat_lon
             break
 
     if chosen_ir is None:
-        # No source covers this tile — try the closest regardless
-        _, (chosen_ir, chosen_vis, _) = ranked[0]
+        _, (chosen_ir, chosen_vis, chosen_lon) = ranked[0]
+        logger.warning(
+            "No source covers tile z=%d x=%d y=%d (center %.2f,%.2f) — using sat_lon=%.1f",
+            z, x, y, center_lat, center_lon, chosen_lon,
+        )
+    else:
+        logger.debug(
+            "Tile z=%d x=%d y=%d (center %.2f,%.2f) → sat_lon=%.1f",
+            z, x, y, center_lat, center_lon, chosen_lon,
+        )
 
     return render_geo_satellite_tile(
         ir_source=chosen_ir,
