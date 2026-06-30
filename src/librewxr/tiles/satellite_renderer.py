@@ -205,88 +205,60 @@ def render_multi_satellite_tile(
     tile_size: int = 256,
     fmt: str = "png",
 ) -> bytes | None:
-    """Render a satellite tile by selecting the best single source per tile.
+    """Render a satellite tile, filling scan-edge gaps from secondary sources.
 
     Each entry in *sources* is ``(ir_source, vis_source_or_None, sat_lon)``
     where ``sat_lon`` is the sub-satellite longitude in degrees.
 
-    Selection: compute the tile center longitude, then pick the source
-    whose sub-satellite point is closest — that satellite has the lowest
-    zenith angle and therefore the best data for this tile.  If that
-    source's scan grid doesn't cover the tile center (e.g. CONUS sector
-    edge), fall through to the next-closest source.
-
-    No per-pixel blending — each tile comes from exactly one satellite.
-    This prevents artifacts where two satellites disagree on brightness
-    at individual pixels due to different view angles.
+    Strategy: rank sources by viewing angle (closest sub-satellite longitude).
+    Render from the best source first. If the result has transparent pixels
+    (scan edge gaps), fill those from the next source. Each pixel comes from
+    exactly one satellite — no brightness blending.
     """
-    # Compute tile center for source selection
     lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
-    center_lat = float(lat_grid[tile_size // 2, tile_size // 2])
     center_lon = float(lon_grid[tile_size // 2, tile_size // 2])
+    shape = lat_grid.shape
 
     # Rank sources by angular distance from tile center to sub-satellite point
     ranked = sorted(
-        enumerate(sources),
-        key=lambda item: min(
-            abs(center_lon - item[1][2]),
-            360.0 - abs(center_lon - item[1][2]),
-        ),
+        sources,
+        key=lambda s: min(abs(center_lon - s[2]), 360.0 - abs(center_lon - s[2])),
     )
 
-    # Pick the closest source that covers the tile center AND has data there.
-    # A source's grid may geometrically cover the tile but contain no actual
-    # scan data at the western/eastern edge of the CONUS sector.
-    chosen_ir = None
-    chosen_vis = None
-    center_lat_arr = np.array([center_lat], dtype=np.float64)
-    center_lon_arr = np.array([center_lon], dtype=np.float64)
-    for _idx, (ir_source, vis_source, _sat_lon) in ranked:
-        if not _source_covers_point(ir_source, center_lat, center_lon):
-            continue
-        probe = ir_source.sample(center_lat_arr, center_lon_arr, timestamp)
-        if probe[0] > 0:
-            chosen_ir = ir_source
-            chosen_vis = vis_source
+    out_brightness = np.zeros(shape, dtype=np.float32)
+    has_data = np.zeros(shape, dtype=bool)
+
+    for ir_source, vis_source, _sat_lon in ranked:
+        # Only sample pixels we don't already have
+        need = ~has_data
+        if not np.any(need):
             break
 
-    if chosen_ir is None:
-        _, (chosen_ir, chosen_vis, _) = ranked[0]
+        ir_encoded = ir_source.sample(lat_grid, lon_grid, timestamp)
+        ir_brightness = ir_encoded.astype(np.float32)
 
-    return render_geo_satellite_tile(
-        ir_source=chosen_ir,
-        vis_source=chosen_vis,
-        z=z, x=x, y=y,
-        tile_size=tile_size,
-        timestamp=timestamp,
-        fmt=fmt,
-    )
+        if vis_source is not None:
+            vis_encoded = vis_source.sample(lat_grid, lon_grid, timestamp)
+            vis_brightness = vis_encoded.astype(np.float32)
+            vis_alpha = vis_encoded.astype(np.float32) / 255.0
+            src_brightness = vis_brightness * vis_alpha + ir_brightness * (1.0 - vis_alpha)
+            src_has_data = (ir_encoded > 0) | (vis_encoded > 0)
+        else:
+            src_brightness = ir_brightness
+            src_has_data = ir_encoded > 0
 
+        # Fill only the gaps — pixels already covered keep their value
+        fill = need & src_has_data
+        out_brightness = np.where(fill, src_brightness, out_brightness)
+        has_data = has_data | fill
 
-def _source_covers_point(source, lat: float, lon: float) -> bool:
-    """Check if a geostationary source's scan grid covers a given point."""
-    from librewxr.tiles.geostationary import forward as geo_forward
+    rgba = np.zeros((*shape, 4), dtype=np.uint8)
+    rgba[..., 0] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 1] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 2] = np.clip(out_brightness, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.where(has_data, np.uint8(255), np.uint8(0))
 
-    if source._x_vec is None or source._y_vec is None:
-        return False
-
-    x_ang, y_ang = geo_forward(
-        np.array([lat], dtype=np.float64),
-        np.array([lon], dtype=np.float64),
-        source.sat_lon,
-        source.sat_height,
-    )
-
-    if np.isnan(x_ang[0]) or np.isnan(y_ang[0]):
-        return False
-
-    x_step = (source._x_vec[-1] - source._x_vec[0]) / (source._grid_width - 1)
-    y_step = (source._y_vec[0] - source._y_vec[-1]) / (source._grid_height - 1)
-
-    col = (x_ang[0] - source._x_vec[0]) / x_step
-    row = (source._y_vec[0] - y_ang[0]) / y_step
-
-    return 0 <= col < source._grid_width and 0 <= row < source._grid_height
+    return _encode_image(Image.fromarray(rgba, "RGBA"), fmt)
 
 
 def _encode_image(img: Image.Image, fmt: str) -> bytes:
