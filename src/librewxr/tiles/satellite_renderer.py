@@ -234,11 +234,18 @@ def render_multi_satellite_tile(
         ),
     )
 
-    # Pick the closest source whose scan grid covers the tile center
+    # Pick the closest source that covers the tile center AND has data there.
+    # A source's grid may geometrically cover the tile but contain no actual
+    # scan data at the western/eastern edge of the CONUS sector.
     chosen_ir = None
     chosen_vis = None
+    center_lat_arr = np.array([center_lat], dtype=np.float64)
+    center_lon_arr = np.array([center_lon], dtype=np.float64)
     for _idx, (ir_source, vis_source, _sat_lon) in ranked:
-        if _source_covers_point(ir_source, center_lat, center_lon):
+        if not _source_covers_point(ir_source, center_lat, center_lon):
+            continue
+        probe = ir_source.sample(center_lat_arr, center_lon_arr, timestamp)
+        if probe[0] > 0:
             chosen_ir = ir_source
             chosen_vis = vis_source
             break
