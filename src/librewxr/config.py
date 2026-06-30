@@ -501,19 +501,15 @@ class Settings(BaseSettings):
         return past_hours + future_hours + 2
 
     def get_bbox(self) -> tuple[float, float, float, float] | None:
-        """Return parsed BBOX expanded to 2x in each dimension.
+        """Return parsed BBOX as (south, west, north, east).
 
-        The operator specifies the region of interest; the data crop
-        extends 50% beyond each edge so tiles at the viewport boundary
-        always have data and approaching weather is visible.
+        The operator sets ``LIBREWXR_BBOX`` to the full desired coverage
+        area.  No expansion is applied — the value means what it says.
         """
         if not self.bbox:
             return None
         parts = [float(x.strip()) for x in self.bbox.split(",")]
-        south, west, north, east = parts[0], parts[1], parts[2], parts[3]
-        lat_pad = (north - south) * 1.5
-        lon_pad = (east - west) * 1.5
-        return (south - lat_pad, west - lon_pad, north + lat_pad, east + lon_pad)
+        return (parts[0], parts[1], parts[2], parts[3])
 
     def get_enabled_regions(self) -> list[str]:
         """Resolve the region spec into individual region names."""
