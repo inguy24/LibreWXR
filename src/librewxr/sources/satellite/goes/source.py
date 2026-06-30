@@ -43,7 +43,7 @@ GOES_HEIGHT = 35786023.0  # metres above ellipsoid
 # GMGSI convention: cold (high cloud) = high uint8, warm (ground) = low.
 # We invert: encode = 255 * (T_MAX - T) / (T_MAX - T_MIN), clamped.
 _IR_T_MIN = 170.0  # K — coldest cloud tops (~-103°C)
-_IR_T_MAX = 350.0  # K — hottest ground surfaces (~77°C / 170°F)
+_IR_T_MAX = 320.0  # K — warmest ground/ocean (~47°C)
 _IR_RANGE = _IR_T_MAX - _IR_T_MIN
 
 

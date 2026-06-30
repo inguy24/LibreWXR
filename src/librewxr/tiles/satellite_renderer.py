@@ -205,114 +205,82 @@ def render_multi_satellite_tile(
     tile_size: int = 256,
     fmt: str = "png",
 ) -> bytes | None:
-    """Render a composite tile from multiple geostationary satellite families.
+    """Render a satellite tile by selecting the best single source per tile.
 
     Each entry in *sources* is ``(ir_source, vis_source_or_None, sat_lon)``
-    where ``sat_lon`` is the sub-satellite longitude in degrees.  Per-pixel
-    source selection prefers the satellite whose sub-satellite longitude is
-    closest to the pixel's longitude — a proxy for lower zenith angle and
-    therefore less atmospheric distortion.
+    where ``sat_lon`` is the sub-satellite longitude in degrees.
 
-    When only one family has data at a given pixel the value is used
-    directly.  When no family has data the pixel is transparent (alpha=0).
+    Selection: compute the tile center longitude, then pick the source
+    whose sub-satellite point is closest — that satellite has the lowest
+    zenith angle and therefore the best data for this tile.  If that
+    source's scan grid doesn't cover the tile center (e.g. CONUS sector
+    edge), fall through to the next-closest source.
 
-    VIS-over-IR compositing uses the same math as
-    ``render_geo_satellite_tile()``: when VIS data is available, it is
-    blended over IR using ``vis_alpha = vis_encoded / 255``.
+    No per-pixel blending — each tile comes from exactly one satellite.
+    This prevents artifacts where two satellites disagree on brightness
+    at individual pixels due to different view angles.
     """
+    # Compute tile center for source selection
     lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
+    center_lat = float(lat_grid[tile_size // 2, tile_size // 2])
+    center_lon = float(lon_grid[tile_size // 2, tile_size // 2])
 
-    # Sample each source family and collect per-source data planes
-    ir_planes: list[np.ndarray] = []
-    vis_planes: list[np.ndarray | None] = []
-    sat_lons: list[float] = []
+    # Rank sources by angular distance from tile center to sub-satellite point
+    ranked = sorted(
+        enumerate(sources),
+        key=lambda item: min(
+            abs(center_lon - item[1][2]),
+            360.0 - abs(center_lon - item[1][2]),
+        ),
+    )
 
-    for ir_source, vis_source, sat_lon in sources:
-        ir_encoded = ir_source.sample(lat_grid, lon_grid, timestamp)
-        ir_planes.append(ir_encoded)
-        if vis_source is not None:
-            vis_planes.append(vis_source.sample(lat_grid, lon_grid, timestamp))
-        else:
-            vis_planes.append(None)
-        sat_lons.append(sat_lon)
+    # Pick the closest source whose scan grid covers the tile center
+    chosen_ir = None
+    chosen_vis = None
+    for _idx, (ir_source, vis_source, _sat_lon) in ranked:
+        if _source_covers_point(ir_source, center_lat, center_lon):
+            chosen_ir = ir_source
+            chosen_vis = vis_source
+            break
 
-    n_sources = len(sources)
-    shape = lat_grid.shape
+    if chosen_ir is None:
+        # No source covers this tile — try the closest regardless
+        _, (chosen_ir, chosen_vis, _) = ranked[0]
 
-    # Fast path: single source — identical to render_geo_satellite_tile()
-    if n_sources == 1:
-        ir_encoded = ir_planes[0]
-        vis_encoded = vis_planes[0]
-        ir_brightness = ir_encoded.astype(np.float32)
+    return render_geo_satellite_tile(
+        ir_source=chosen_ir,
+        vis_source=chosen_vis,
+        z=z, x=x, y=y,
+        tile_size=tile_size,
+        timestamp=timestamp,
+        fmt=fmt,
+    )
 
-        if vis_encoded is not None:
-            vis_brightness = vis_encoded.astype(np.float32)
-            vis_alpha = vis_encoded.astype(np.float32) / 255.0
-            out_brightness = vis_brightness * vis_alpha + ir_brightness * (1.0 - vis_alpha)
-            has_data = (ir_encoded > 0) | (vis_encoded > 0)
-        else:
-            out_brightness = ir_brightness
-            has_data = ir_encoded > 0
 
-        rgba = np.zeros((*shape, 4), dtype=np.uint8)
-        rgba[..., 0] = np.clip(out_brightness, 0, 255).astype(np.uint8)
-        rgba[..., 1] = np.clip(out_brightness, 0, 255).astype(np.uint8)
-        rgba[..., 2] = np.clip(out_brightness, 0, 255).astype(np.uint8)
-        rgba[..., 3] = np.where(has_data, np.uint8(255), np.uint8(0))
-        return _encode_image(Image.fromarray(rgba, "RGBA"), fmt)
+def _source_covers_point(source, lat: float, lon: float) -> bool:
+    """Check if a geostationary source's scan grid covers a given point."""
+    from librewxr.tiles.geostationary import forward as geo_forward
 
-    # Multi-source: per-pixel selection by proximity to sub-satellite longitude
-    # Build per-source composited brightness (VIS-over-IR) and has_data masks
-    src_brightness = np.zeros((n_sources, *shape), dtype=np.float32)
-    src_has_data = np.zeros((n_sources, *shape), dtype=bool)
+    if source._x_vec is None or source._y_vec is None:
+        return False
 
-    for i in range(n_sources):
-        ir_encoded = ir_planes[i]
-        vis_encoded = vis_planes[i]
-        ir_brightness = ir_encoded.astype(np.float32)
+    x_ang, y_ang = geo_forward(
+        np.array([lat], dtype=np.float64),
+        np.array([lon], dtype=np.float64),
+        source.sat_lon,
+        source.sat_height,
+    )
 
-        if vis_encoded is not None:
-            vis_brightness = vis_encoded.astype(np.float32)
-            vis_alpha = vis_encoded.astype(np.float32) / 255.0
-            composited = vis_brightness * vis_alpha + ir_brightness * (1.0 - vis_alpha)
-            has_data = (ir_encoded > 0) | (vis_encoded > 0)
-        else:
-            composited = ir_brightness
-            has_data = ir_encoded > 0
+    if np.isnan(x_ang[0]) or np.isnan(y_ang[0]):
+        return False
 
-        src_brightness[i] = composited
-        src_has_data[i] = has_data
+    x_step = (source._x_vec[-1] - source._x_vec[0]) / (source._grid_width - 1)
+    y_step = (source._y_vec[0] - source._y_vec[-1]) / (source._grid_height - 1)
 
-    # Compute angular distance from each pixel's longitude to each source's
-    # sub-satellite longitude.  Use absolute difference, wrapping at ±180°.
-    lon_f64 = lon_grid.astype(np.float64)
-    best_idx = np.full(shape, -1, dtype=np.int32)
-    best_dist = np.full(shape, 999.0, dtype=np.float64)
+    col = (x_ang[0] - source._x_vec[0]) / x_step
+    row = (source._y_vec[0] - y_ang[0]) / y_step
 
-    for i, sat_lon in enumerate(sat_lons):
-        diff = np.abs(lon_f64 - sat_lon)
-        diff = np.minimum(diff, 360.0 - diff)  # wrap across antimeridian
-        # Only consider pixels where this source has data
-        candidate = src_has_data[i]
-        closer = candidate & (diff < best_dist)
-        best_idx = np.where(closer, i, best_idx)
-        best_dist = np.where(closer, diff, best_dist)
-
-    # Assemble output from the selected source per pixel
-    out_brightness = np.zeros(shape, dtype=np.float32)
-    has_any_data = best_idx >= 0
-
-    for i in range(n_sources):
-        mask = best_idx == i
-        out_brightness = np.where(mask, src_brightness[i], out_brightness)
-
-    rgba = np.zeros((*shape, 4), dtype=np.uint8)
-    rgba[..., 0] = np.clip(out_brightness, 0, 255).astype(np.uint8)
-    rgba[..., 1] = np.clip(out_brightness, 0, 255).astype(np.uint8)
-    rgba[..., 2] = np.clip(out_brightness, 0, 255).astype(np.uint8)
-    rgba[..., 3] = np.where(has_any_data, np.uint8(255), np.uint8(0))
-
-    return _encode_image(Image.fromarray(rgba, "RGBA"), fmt)
+    return 0 <= col < source._grid_width and 0 <= row < source._grid_height
 
 
 def _encode_image(img: Image.Image, fmt: str) -> bytes:
