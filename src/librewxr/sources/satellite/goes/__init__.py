@@ -3,8 +3,12 @@
 """GOES-18 / GOES-19 ABI satellite source package.
 
 High-resolution (2 km IR, 2 km VIS) geostationary imagery for the
-Americas at 5-minute cadence.  Auto-selects GOES-18 (West, 137°W) or
-GOES-19 (East, 75.2°W) based on the operator's BBOX center longitude.
+Americas at 5-minute cadence.  When ``multi_satellite`` is True
+(default), both GOES-18 and GOES-19 are enabled if the BBOX is visible
+to each satellite's disk — the per-pixel compositor fills coverage gaps
+from either satellite's CONUS sector scan limits.  When
+``multi_satellite`` is False, auto-selects one satellite based on center
+longitude.
 
 When the operator's location is not in the Americas (or cannot be
 determined), returns ``[]`` so GMGSI takes over as the global fallback.
@@ -12,12 +16,14 @@ determined), returns ``[]`` so GMGSI takes over as the global fallback.
 from __future__ import annotations
 
 from librewxr.sources._base import SatelliteContribution
+from librewxr.sources.satellite._geo_base import bbox_overlaps_disk
 
 from .source import (
     GOES18IRSource,
     GOES18VISSource,
     GOES19IRSource,
     GOES19VISSource,
+    GOES_HEIGHT,
 )
 
 __all__ = [
@@ -27,6 +33,9 @@ __all__ = [
     "GOES19VISSource",
     "satellite_provider",
 ]
+
+_GOES18_LON = -137.0
+_GOES19_LON = -75.2
 
 
 def _center_longitude(settings) -> float | None:
@@ -109,12 +118,16 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
     """Return GOES IR + VIS contributions when the station is in the Americas.
 
     Selection logic:
-    - Longitude between -170° and -30°: GOES coverage
-    - West of -100°: GOES-18 (West)
-    - East of -100°: GOES-19 (East)
-    - When ``multi_satellite`` is True and the BBOX spans the -100°
-      boundary: both GOES-18 and GOES-19 are enabled simultaneously.
-    - Otherwise: return [] (fall through to Himawari or GMGSI)
+    - Longitude between -170° and -30°: GOES coverage zone
+    - When ``multi_satellite`` is True (default): enable each GOES
+      satellite whose geostationary disk overlaps the BBOX.  Each
+      satellite's CONUS sector has limited cross-hemisphere scan extent
+      (the boundary is curved in lat/lon space because scan angles are
+      fixed in geostationary projection), so using both ensures full
+      BBOX coverage through the per-pixel compositor.
+    - When ``multi_satellite`` is False: single satellite selected by
+      center longitude (west of -100° → GOES-18, east → GOES-19).
+    - Outside Americas: return [] (fall through to Himawari or GMGSI).
     """
     if not getattr(settings, "goes_enabled", True):
         return []
@@ -132,23 +145,28 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
     vis_hires = getattr(settings, "goes_vis_hires", False)
     vis_downsample = 1 if vis_hires else 4  # 0.5 km native -> 2 km default
 
-    # BBOX-edge-aware: when multi_satellite is True and BBOX spans -100°,
-    # enable both GOES-18 and GOES-19.
-    spans_boundary = False
-    if getattr(settings, "multi_satellite", True) and bbox is not None:
-        _, west, _, east = bbox
-        spans_boundary = west < -100.0 and east > -100.0
-
     contributions: list[SatelliteContribution] = []
 
-    if spans_boundary:
-        # Both GOES-18 (west of -100°) and GOES-19 (east of -100°)
-        contributions.extend(
-            _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample),
-        )
-        contributions.extend(
-            _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample),
-        )
+    if getattr(settings, "multi_satellite", True) and bbox is not None:
+        if bbox_overlaps_disk(bbox, _GOES18_LON, GOES_HEIGHT):
+            contributions.extend(
+                _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+            )
+        if bbox_overlaps_disk(bbox, _GOES19_LON, GOES_HEIGHT):
+            contributions.extend(
+                _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+            )
+        if not contributions:
+            # BBOX visible from neither disk — shouldn't happen for Americas,
+            # but fall through to center-based selection as safety net.
+            if center_lon < -100.0:
+                contributions.extend(
+                    _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+                )
+            else:
+                contributions.extend(
+                    _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+                )
     elif center_lon < -100.0:
         contributions.extend(
             _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample),

@@ -5,15 +5,21 @@
 High-resolution (2 km IR, 1 km VIS) geostationary imagery for
 Asia-Pacific at 10-minute cadence from ``s3://noaa-himawari9/``.
 
-Auto-selected when the operator's BBOX center is between 60°E and 180°E.
-Returns ``[]`` for stations outside Asia-Pacific, falling through to
-GMGSI as the global fallback.
+When ``multi_satellite`` is True, enabled whenever the operator's BBOX
+overlaps Himawari's geostationary disk (checked via forward projection,
+not longitude thresholds — correctly handles Pacific BBOXes with
+negative longitudes like Hawaii at -160°W).  When ``multi_satellite``
+is False, center-longitude selection: 60°E to 180°E.
+
+Returns ``[]`` for stations outside coverage, falling through to GMGSI
+as the global fallback.
 """
 from __future__ import annotations
 
 from librewxr.sources._base import SatelliteContribution
+from librewxr.sources.satellite._geo_base import bbox_overlaps_disk
 
-from .source import HimawariIRSource, HimawariVISSource
+from .source import HIMAWARI_HEIGHT, HIMAWARI_LON, HimawariIRSource, HimawariVISSource
 
 __all__ = ["HimawariIRSource", "HimawariVISSource", "satellite_provider"]
 
@@ -34,30 +40,26 @@ def _center_longitude(settings) -> float | None:
 def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
     """Return Himawari IR + VIS contributions for Asia-Pacific stations.
 
-    Coverage: longitude 60°E to 180°E (Japan, Korea, SE Asia, Oceania,
-    eastern Africa coast, western Pacific).
+    When ``multi_satellite`` is True, uses the geostationary forward
+    projection to check whether any part of the BBOX is visible to
+    Himawari-9 (at 140.7°E).  This correctly handles Pacific BBOXes
+    with negative longitudes (e.g. Hawaii at -160°W, Guam at 144°E)
+    that the previous simple longitude-range check missed.
 
-    When ``multi_satellite`` is True, the BBOX (not just the center) is
-    checked for overlap with the 60°E-180°E zone.  This means a station
-    centered in GOES territory but with a wide enough BBOX reaching into
-    Himawari coverage will also get Himawari contributions.
+    When ``multi_satellite`` is False, falls back to center-longitude
+    selection: 60°E to 180°E.
     """
     if not getattr(settings, "himawari_enabled", True):
         return []
 
     center_lon = _center_longitude(settings)
-
-    # BBOX-edge-aware: when multi_satellite is True and the BBOX overlaps
-    # the 60°E-180°E Himawari coverage zone, enable Himawari even if the
-    # center is outside that zone.
     bbox = getattr(settings, "get_bbox", lambda: None)()
-    bbox_overlaps = False
-    if getattr(settings, "multi_satellite", True) and bbox is not None:
-        _, west, _, east = bbox
-        bbox_overlaps = west < 180.0 and east > 60.0
 
-    if bbox_overlaps:
-        # BBOX overlaps Himawari coverage — proceed regardless of center
+    disk_overlap = False
+    if getattr(settings, "multi_satellite", True) and bbox is not None:
+        disk_overlap = bbox_overlaps_disk(bbox, HIMAWARI_LON, HIMAWARI_HEIGHT)
+
+    if disk_overlap:
         pass
     elif center_lon is None:
         return []

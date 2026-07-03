@@ -34,6 +34,40 @@ from librewxr.tiles.geostationary import forward as geo_forward
 
 logger = logging.getLogger(__name__)
 
+# Standard GEO orbital height (metres above ellipsoid) — shared by GOES
+# and Himawari.  Individual sources override via their class var, but this
+# constant is good enough for the coarse "is the BBOX visible?" check below.
+_GEO_HEIGHT = 35786023.0
+
+
+def bbox_overlaps_disk(
+    bbox: tuple[float, float, float, float],
+    sat_lon: float,
+    sat_height: float = _GEO_HEIGHT,
+) -> bool:
+    """Check whether any part of a BBOX is visible to a geostationary satellite.
+
+    Tests the four corners plus edge midpoints against the satellite's
+    forward projection.  Returns True if at least one test point is on the
+    visible disk (non-NaN scan angles).  Used by satellite providers to
+    decide whether to enable a family for the operator's BBOX.
+    """
+    south, west, north, east = bbox
+    mid_lat = (south + north) / 2.0
+    mid_lon = (west + east) / 2.0
+    test_lats = np.array([
+        south, south, north, north, mid_lat,
+        south, north, mid_lat, mid_lat,
+    ])
+    test_lons = np.array([
+        west, east, west, east, mid_lon,
+        mid_lon, mid_lon, west, east,
+    ])
+    x_ang, y_ang = geo_forward(
+        test_lats, test_lons, sat_lon, sat_height,
+    )
+    return bool(np.any(~(np.isnan(x_ang) | np.isnan(y_ang))))
+
 
 class GeoSatSource:
     """Abstract base for one channel of a geostationary satellite."""
