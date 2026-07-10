@@ -543,111 +543,135 @@ class WMOAlertsFetcher:
         return entries
 
     async def _fetch_once(self) -> None:
-        """Full ingest pipeline."""
+        """Full ingest pipeline.
+
+        Only fetches alert feeds relevant to the configured regions:
+        NWS API for US regions, WMO CAP feeds for everything else.
+        """
         client = await self._get_client()
 
-        # Fetch NWS alerts in parallel with WMO (no CAP XML parsing needed)
-        nws_task = asyncio.create_task(self._fetch_nws_alerts())
+        # Determine which feeds are needed based on enabled regions.
+        from librewxr.data.regions import REGION_GROUPS
+        enabled = set(settings.get_enabled_regions())
+        us_regions = set(REGION_GROUPS.get("US", []))
+        need_nws = bool(enabled & us_regions)
+        need_wmo = bool(enabled - us_regions)
 
-        # 1. Fetch sources.json
-        resp = await retry_get(client, _SOURCES_URL, log_name="wmo_sources")
-        if resp is None or resp.status_code != 200:
-            logger.warning("Failed to fetch sources.json")
-            self._store.mark_failed()
+        if not need_nws and not need_wmo:
+            logger.warning("No regions enabled, skipping alert fetch")
             return
-        sources_data = resp.json()
-        sources = sources_data.get("sources", [])
 
-        # 2. Fetch wmo_all.json
-        resp = await retry_get(client, _WMO_ALL_URL, log_name="wmo_all")
-        if resp is None or resp.status_code != 200:
-            logger.warning("Failed to fetch wmo_all.json")
-            self._store.mark_failed()
-            return
-        wmo_all_data = resp.json()
-        wmo_all_items = wmo_all_data.get("items", [])
+        nws_task = None
+        if need_nws:
+            nws_task = asyncio.create_task(self._fetch_nws_alerts())
 
-        # Build set of current alert IDs
-        current_ids = {item.get("id") for item in wmo_all_items if item.get("id")}
-        current_agencies = set()
-        for record in wmo_all_items:
-            cap_url = record.get("capURL", "") or ""
-            url = record.get("url", "") or ""
-            if cap_url:
-                current_agencies.add(cap_url.split("/")[0])
-            elif url:
-                current_agencies.add(url.split("/")[0])
-
-        # Filter operating sources
-        source_ids: list[str] = []
-        for entry in sources:
-            src = entry.get("source", {})
-            sid = src.get("sourceId")
-            status = src.get("capAlertFeedStatus")
-            if not sid or status != "operating":
-                continue
-            if sid in _EXCLUDED_SOURCE_IDS:
-                continue
-            if sid in current_agencies:
-                source_ids.append(sid)
-
-        logger.info("Fetching alerts from %d WMO sources", len(source_ids))
-
-        # 3. Fetch RSS feeds and CAP XMLs
-        sem = asyncio.Semaphore(self._concurrency)
+        wmo_count = 0
         all_alerts: list[AlertEntry] = []
 
-        async def process_feed(sid: str) -> None:
-            feed_url = f"{_WMO_BASE}/v2/cap-alerts/{sid}/rss.xml"
-            async with sem:
-                resp = await retry_get(client, feed_url, log_name=f"rss_{sid}")
+        if need_wmo:
+            # 1. Fetch sources.json
+            resp = await retry_get(client, _SOURCES_URL, log_name="wmo_sources")
             if resp is None or resp.status_code != 200:
+                logger.warning("Failed to fetch sources.json")
+                self._store.mark_failed()
                 return
-            feed_bytes = resp.content
-            items = _rss_item_links(feed_bytes)
+            sources_data = resp.json()
+            sources = sources_data.get("sources", [])
 
-            # Filter to current alert IDs
-            filtered: list[str] = []
-            for link, guid in items:
-                if not link:
+            # 2. Fetch wmo_all.json
+            resp = await retry_get(client, _WMO_ALL_URL, log_name="wmo_all")
+            if resp is None or resp.status_code != 200:
+                logger.warning("Failed to fetch wmo_all.json")
+                self._store.mark_failed()
+                return
+            wmo_all_data = resp.json()
+            wmo_all_items = wmo_all_data.get("items", [])
+
+            # Build set of current alert IDs
+            current_ids = {item.get("id") for item in wmo_all_items if item.get("id")}
+            current_agencies = set()
+            for record in wmo_all_items:
+                cap_url = record.get("capURL", "") or ""
+                url = record.get("url", "") or ""
+                if cap_url:
+                    current_agencies.add(cap_url.split("/")[0])
+                elif url:
+                    current_agencies.add(url.split("/")[0])
+
+            # Filter operating sources
+            source_ids: list[str] = []
+            for entry in sources:
+                src = entry.get("source", {})
+                sid = src.get("sourceId")
+                status = src.get("capAlertFeedStatus")
+                if not sid or status != "operating":
                     continue
-                if guid and guid in current_ids:
-                    filtered.append(link)
-                elif guid and any(guid in cid for cid in current_ids):
-                    filtered.append(link)
+                if sid in _EXCLUDED_SOURCE_IDS:
+                    continue
+                if sid in current_agencies:
+                    source_ids.append(sid)
 
-            # Fetch CAP XMLs concurrently per feed
-            async def fetch_and_extract(cap_link: str) -> list[AlertEntry]:
+            logger.info("Fetching alerts from %d WMO sources", len(source_ids))
+
+            # 3. Fetch RSS feeds and CAP XMLs
+            sem = asyncio.Semaphore(self._concurrency)
+
+            async def process_feed(sid: str) -> None:
+                feed_url = f"{_WMO_BASE}/v2/cap-alerts/{sid}/rss.xml"
                 async with sem:
-                    resp = await retry_get(client, cap_link, log_name=f"cap_{sid}")
+                    resp = await retry_get(client, feed_url, log_name=f"rss_{sid}")
                 if resp is None or resp.status_code != 200:
-                    return []
-                return _extract_polygons_from_cap(
-                    resp.text, sid, cap_link, self._meteoalarm
-                )
+                    return
+                feed_bytes = resp.content
+                items = _rss_item_links(feed_bytes)
 
-            tasks = [asyncio.create_task(fetch_and_extract(link)) for link in filtered]
-            for coro in asyncio.as_completed(tasks):
-                try:
-                    entries = await coro
-                    all_alerts.extend(entries)
-                except Exception:
-                    continue
+                # Filter to current alert IDs
+                filtered: list[str] = []
+                for link, guid in items:
+                    if not link:
+                        continue
+                    if guid and guid in current_ids:
+                        filtered.append(link)
+                    elif guid and any(guid in cid for cid in current_ids):
+                        filtered.append(link)
 
-        await asyncio.gather(*(process_feed(sid) for sid in source_ids))
+                # Fetch CAP XMLs concurrently per feed
+                async def fetch_and_extract(cap_link: str) -> list[AlertEntry]:
+                    async with sem:
+                        resp = await retry_get(client, cap_link, log_name=f"cap_{sid}")
+                    if resp is None or resp.status_code != 200:
+                        return []
+                    return _extract_polygons_from_cap(
+                        resp.text, sid, cap_link, self._meteoalarm
+                    )
+
+                tasks = [asyncio.create_task(fetch_and_extract(link)) for link in filtered]
+                for coro in asyncio.as_completed(tasks):
+                    try:
+                        entries = await coro
+                        all_alerts.extend(entries)
+                    except Exception:
+                        continue
+
+            await asyncio.gather(*(process_feed(sid) for sid in source_ids))
+            wmo_count = len(all_alerts)
+        else:
+            logger.info("Skipping WMO feeds (no non-US regions enabled)")
 
         # 4. Merge NWS results
-        nws_alerts = await nws_task
-        all_alerts.extend(nws_alerts)
+        nws_count = 0
+        if nws_task is not None:
+            nws_alerts = await nws_task
+            all_alerts.extend(nws_alerts)
+            nws_count = len(nws_alerts)
+        elif not need_nws:
+            logger.info("Skipping NWS API (no US regions enabled)")
 
         # 5. Replace store
         self._store.replace_all(all_alerts)
         logger.info(
-            "Alerts updated: %d total (%d WMO + %d NWS) from %d sources",
-            len(all_alerts),
-            len(all_alerts) - len(nws_alerts),
-            len(nws_alerts),
-            len(source_ids),
+            "Alerts updated: %d total (%d WMO + %d NWS)",
+            len(all_alerts), wmo_count, nws_count,
         )
 
     async def _fetch_loop(self) -> None:
