@@ -3,6 +3,7 @@
 
 import asyncio
 import csv
+import dataclasses
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from typing import Optional
 import httpx
 from lxml import etree
 from shapely.geometry import Polygon, shape
+from shapely.ops import unary_union
 
 from librewxr.config import settings
 from librewxr.data.alerts_store import AlertEntry, AlertsStore
@@ -28,6 +30,10 @@ _WMO_ALL_URL = f"{_WMO_BASE}/v2/json/wmo_all.json"
 # NWS API (direct GeoJSON, avoids WMO lag for US alerts)
 _NWS_API_URL = "https://api.weather.gov/alerts/active"
 _NWS_USER_AGENT = "(LibreWXR, librewxr@localhost)"
+
+# Cache for NWS zone boundary polygons.  Zone boundaries rarely change,
+# so resolved geometries persist for the lifetime of the process.
+_zone_geometry_cache: dict[str, Optional[object]] = {}
 
 # Excluded sources: known bad feeds, data quality issues, or sources handled
 # directly via a separate pipeline (e.g., NWS API for US alerts).
@@ -297,6 +303,70 @@ def _parse_cap_time(value: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# NWS zone geometry resolution
+# ---------------------------------------------------------------------------
+
+async def _resolve_zone_geometries(
+    client: httpx.AsyncClient,
+    zone_urls: list[str],
+    timeout: float = 10.0,
+) -> dict[str, Optional[object]]:
+    """Resolve NWS zone URLs to shapely geometries, with caching.
+
+    Each zone URL (e.g. https://api.weather.gov/zones/forecast/AZZ537)
+    returns a GeoJSON Feature whose geometry is the zone boundary polygon.
+    Results are cached in the module-level ``_zone_geometry_cache`` so that
+    repeated ingest cycles don't re-fetch stable zone boundaries.
+
+    Returns a dict mapping each input URL to its resolved geometry (or None
+    if the fetch failed).
+    """
+    sem = asyncio.Semaphore(5)
+
+    # Only fetch URLs not already in the cache
+    to_fetch = [url for url in zone_urls if url not in _zone_geometry_cache]
+
+    async def fetch_zone(url: str) -> None:
+        async with sem:
+            try:
+                logger.debug("Fetching NWS zone geometry: %s", url)
+                resp = await client.get(
+                    url,
+                    headers={"User-Agent": _NWS_USER_AGENT},
+                    timeout=timeout,
+                )
+                if resp.status_code != 200:
+                    logger.debug(
+                        "NWS zone %s returned %d", url, resp.status_code
+                    )
+                    _zone_geometry_cache[url] = None
+                    return
+                data = resp.json()
+                geom = data.get("geometry")
+                if geom is not None:
+                    _zone_geometry_cache[url] = shape(geom)
+                else:
+                    _zone_geometry_cache[url] = None
+            except Exception as exc:
+                logger.debug("Failed to fetch NWS zone %s: %s", url, exc)
+                _zone_geometry_cache[url] = None
+
+    if to_fetch:
+        logger.debug(
+            "Resolving %d NWS zone geometries (%d cached)",
+            len(to_fetch),
+            len(zone_urls) - len(to_fetch),
+        )
+        await asyncio.gather(*(fetch_zone(url) for url in to_fetch))
+
+    # Build results from the (now-populated) cache
+    results: dict[str, Optional[object]] = {}
+    for url in zone_urls:
+        results[url] = _zone_geometry_cache.get(url)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main fetcher class
 # ---------------------------------------------------------------------------
 
@@ -395,6 +465,10 @@ class WMOAlertsFetcher:
             return []
 
         entries: list[AlertEntry] = []
+        # Track which entries need zone resolution and their zone URLs
+        alerts_needing_zones: list[tuple[int, list[str]]] = []
+        all_zone_urls: set[str] = set()
+
         for feature in data.get("features", []):
             props = feature.get("properties", {})
             geom = feature.get("geometry")
@@ -424,6 +498,7 @@ class WMOAlertsFetcher:
             effective = props.get("effective", "")
             expires = props.get("expires", "")
 
+            idx = len(entries)
             entries.append(
                 AlertEntry(
                     source_id="nws-api",
@@ -436,6 +511,44 @@ class WMOAlertsFetcher:
                     url=props.get("id", "") or feature.get("id", ""),
                     polygon=polygon,
                 )
+            )
+
+            # If geometry was null, record the affectedZones for later
+            # resolution so zone-based alerts get proper polygons.
+            if polygon is None:
+                zone_urls = props.get("affectedZones") or []
+                if zone_urls:
+                    alerts_needing_zones.append((idx, zone_urls))
+                    all_zone_urls.update(zone_urls)
+
+        # Resolve zone geometries for null-geometry alerts in batch
+        if all_zone_urls:
+            zone_geoms = await _resolve_zone_geometries(
+                client, list(all_zone_urls)
+            )
+            enriched = 0
+            for idx, zone_urls in alerts_needing_zones:
+                polys = [
+                    zone_geoms[url]
+                    for url in zone_urls
+                    if zone_geoms.get(url) is not None
+                ]
+                if polys:
+                    entries[idx] = dataclasses.replace(
+                        entries[idx], polygon=unary_union(polys)
+                    )
+                    enriched += 1
+            resolved_count = sum(
+                1 for url in all_zone_urls
+                if zone_geoms.get(url) is not None
+            )
+            logger.info(
+                "NWS zone resolution: resolved %d/%d zones, "
+                "enriched %d/%d null-geometry alerts",
+                resolved_count,
+                len(all_zone_urls),
+                enriched,
+                len(alerts_needing_zones),
             )
 
         logger.info("NWS API: %d active alerts", len(entries))
