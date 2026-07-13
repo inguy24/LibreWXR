@@ -197,7 +197,9 @@ class GMGSISource:
 
     def _get_fs(self) -> fsspec.AbstractFileSystem:
         if self._fs is None:
-            self._fs = fsspec.filesystem("s3", anon=True)
+            self._fs = fsspec.filesystem(
+                "s3", anon=True, listings_expiry_time=120,
+            )
         return self._fs
 
     async def fetch(self) -> bool:

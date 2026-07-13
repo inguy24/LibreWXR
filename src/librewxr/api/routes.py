@@ -251,6 +251,24 @@ def _content_type(ext: str) -> str:
     return "image/webp" if ext == "webp" else "image/png"
 
 
+def _thin_to_cadence(timestamps: list[int], cadence_s: int) -> list[int]:
+    """Keep only timestamps spaced at least ``cadence_s`` apart.
+
+    Walks the sorted list and emits each timestamp that is >= cadence_s
+    from the last emitted one.  Always includes the last timestamp so
+    the most recent frame is never dropped.
+    """
+    if not timestamps or cadence_s <= 0:
+        return timestamps
+    result = [timestamps[0]]
+    for ts in timestamps[1:]:
+        if ts - result[-1] >= cadence_s:
+            result.append(ts)
+    if result[-1] != timestamps[-1]:
+        result.append(timestamps[-1])
+    return result
+
+
 @router.get("/public/weather-maps.json")
 async def weather_maps() -> WeatherMapsResponse:
     """Rain Viewer-compatible metadata endpoint."""
@@ -274,11 +292,30 @@ async def weather_maps() -> WeatherMapsResponse:
     # Catalog timestamps come from the active IR source (GOES, Himawari,
     # or GMGSI LW) — whichever the auto-selection loaded.  The IR channel
     # is the 24/7 baseline; VIS only carries the daytime half.
+    #
+    # When multiple satellite families are active (multi-satellite
+    # compositing), the effective display cadence is clamped to the
+    # slowest source's native cadence so the compositor always has data
+    # from every family at each listed timestamp.
     ir_source, _ = _find_satellite_sources()
     if ir_source is not None and ir_source.timestamps:
+        sat_timestamps = sorted(ir_source.timestamps)
+
+        all_families = _find_all_satellite_families()
+        if len(all_families) > 1:
+            slowest_cadence_s = 0
+            for _name, (ir_src, _vis_src) in all_families.items():
+                if isinstance(ir_src, GeoSatSource):
+                    cadence_s = ir_src.cadence_minutes * 60
+                else:
+                    cadence_s = 3600  # GMGSI = hourly
+                slowest_cadence_s = max(slowest_cadence_s, cadence_s)
+            if slowest_cadence_s > 0:
+                sat_timestamps = _thin_to_cadence(sat_timestamps, slowest_cadence_s)
+
         infrared = [
             RadarTimestamp(time=ts, path=f"/v2/satellite/{ts}")
-            for ts in ir_source.timestamps
+            for ts in sat_timestamps
         ]
 
     color_schemes = [

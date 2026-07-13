@@ -68,6 +68,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
 
     per_source = getattr(settings, "himawari_max_frames", 0)
     retention = per_source if per_source > 0 else getattr(settings, "satellite_max_frames", 36)
+    cadence = getattr(settings, "satellite_cadence", 0)
     contributions: list[SatelliteContribution] = []
 
     if getattr(settings, "himawari_ir_enabled", True):
@@ -75,6 +76,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
             SatelliteContribution(
                 instance=HimawariIRSource(
                     cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                    cadence_override=cadence,
                 ),
                 priority=5,
                 name="Himawari-9 IR",
@@ -87,6 +89,7 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
             SatelliteContribution(
                 instance=HimawariVISSource(
                     cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                    cadence_override=cadence,
                 ),
                 priority=6,
                 name="Himawari-9 VIS",

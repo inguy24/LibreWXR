@@ -53,7 +53,7 @@ def _center_longitude(settings) -> float | None:
 
 
 def _goes18_contributions(
-    settings, cache_dir, retention, bbox, vis_downsample,
+    settings, cache_dir, retention, bbox, vis_downsample, cadence,
 ) -> list[SatelliteContribution]:
     """Build GOES-18 (West) IR + VIS contributions."""
     contribs: list[SatelliteContribution] = []
@@ -62,6 +62,7 @@ def _goes18_contributions(
             SatelliteContribution(
                 instance=GOES18IRSource(
                     cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                    cadence_override=cadence,
                 ),
                 priority=5,
                 name="GOES-18 IR",
@@ -74,6 +75,7 @@ def _goes18_contributions(
                 instance=GOES18VISSource(
                     cache_dir=cache_dir, max_frames=retention, bbox=bbox,
                     downsample_factor=vis_downsample,
+                    cadence_override=cadence,
                 ),
                 priority=6,
                 name="GOES-18 VIS",
@@ -84,7 +86,7 @@ def _goes18_contributions(
 
 
 def _goes19_contributions(
-    settings, cache_dir, retention, bbox, vis_downsample,
+    settings, cache_dir, retention, bbox, vis_downsample, cadence,
 ) -> list[SatelliteContribution]:
     """Build GOES-19 (East) IR + VIS contributions."""
     contribs: list[SatelliteContribution] = []
@@ -93,6 +95,7 @@ def _goes19_contributions(
             SatelliteContribution(
                 instance=GOES19IRSource(
                     cache_dir=cache_dir, max_frames=retention, bbox=bbox,
+                    cadence_override=cadence,
                 ),
                 priority=5,
                 name="GOES-19 IR",
@@ -105,6 +108,7 @@ def _goes19_contributions(
                 instance=GOES19VISSource(
                     cache_dir=cache_dir, max_frames=retention, bbox=bbox,
                     downsample_factor=vis_downsample,
+                    cadence_override=cadence,
                 ),
                 priority=6,
                 name="GOES-19 VIS",
@@ -144,36 +148,37 @@ def satellite_provider(settings, cache_dir) -> list[SatelliteContribution]:
     bbox = getattr(settings, "get_bbox", lambda: None)()
     vis_hires = getattr(settings, "goes_vis_hires", False)
     vis_downsample = 1 if vis_hires else 4  # 0.5 km native -> 2 km default
+    cadence = getattr(settings, "satellite_cadence", 0)
 
     contributions: list[SatelliteContribution] = []
 
     if getattr(settings, "multi_satellite", True) and bbox is not None:
         if bbox_overlaps_disk(bbox, _GOES18_LON, GOES_HEIGHT):
             contributions.extend(
-                _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+                _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample, cadence),
             )
         if bbox_overlaps_disk(bbox, _GOES19_LON, GOES_HEIGHT):
             contributions.extend(
-                _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+                _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample, cadence),
             )
         if not contributions:
             # BBOX visible from neither disk — shouldn't happen for Americas,
             # but fall through to center-based selection as safety net.
             if center_lon < -100.0:
                 contributions.extend(
-                    _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+                    _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample, cadence),
                 )
             else:
                 contributions.extend(
-                    _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+                    _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample, cadence),
                 )
     elif center_lon < -100.0:
         contributions.extend(
-            _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+            _goes18_contributions(settings, cache_dir, retention, bbox, vis_downsample, cadence),
         )
     else:
         contributions.extend(
-            _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample),
+            _goes19_contributions(settings, cache_dir, retention, bbox, vis_downsample, cadence),
         )
 
     return contributions

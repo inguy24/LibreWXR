@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     # (36 = 3 hours); Himawari every 10 min (36 = 6 hours).  GOES/Himawari
     # frames are much smaller than GMGSI when a BBOX crop is active.
     satellite_max_frames: int = 36
+    # Satellite display cadence in seconds.  Controls how satellite frame
+    # timestamps are spaced in the weather-maps.json catalog.  0 = auto
+    # (use each source's native cadence: GOES 300s, Himawari 600s, GMGSI
+    # 3600s).  When multi-satellite compositing is active and sources have
+    # different native cadences, the effective cadence is automatically
+    # clamped to the slowest active source regardless of this setting.
+    satellite_cadence: int = 0
     # GOES-18/19 ABI — high-resolution (2 km) satellite imagery for the
     # Americas at 5-min cadence.  Auto-selects GOES-18 (West) or GOES-19
     # (East) based on the BBOX center or station_lon.  When the station

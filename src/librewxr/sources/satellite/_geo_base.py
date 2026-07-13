@@ -96,6 +96,7 @@ class GeoSatSource:
         max_frames: int = 36,
         bbox: tuple[float, float, float, float] | None = None,
         downsample_factor: int = 1,
+        cadence_override: int = 0,
     ) -> None:
         self.name = self.friendly_name
         self._frames: dict[int, np.ndarray] = {}
@@ -104,6 +105,10 @@ class GeoSatSource:
         self._max_frames = max_frames
         self._bbox = bbox
         self._downsample_factor = downsample_factor
+        self._effective_cadence_minutes = (
+            cadence_override // 60 if cadence_override > 0
+            else self.cadence_minutes
+        )
 
         # Per-frame grid metadata (set on first decode)
         self._x_vec: np.ndarray | None = None  # 1-D scan-angle x coords
@@ -153,7 +158,9 @@ class GeoSatSource:
 
     def _get_fs(self) -> fsspec.AbstractFileSystem:
         if self._fs is None:
-            self._fs = fsspec.filesystem("s3", anon=True)
+            self._fs = fsspec.filesystem(
+                "s3", anon=True, listings_expiry_time=120,
+            )
         return self._fs
 
     async def fetch(self) -> bool:
@@ -166,7 +173,7 @@ class GeoSatSource:
     def _fetch_sync(self) -> bool:
         fs = self._get_fs()
         now = datetime.now(timezone.utc)
-        window_hours = max(1, (self._max_frames * self.cadence_minutes) // 60 + 1)
+        window_hours = max(1, (self._max_frames * self._effective_cadence_minutes) // 60 + 1)
         window_start = now - timedelta(hours=window_hours)
         keys = self._list_recent_keys(fs, window_start, now)
         if not keys:
