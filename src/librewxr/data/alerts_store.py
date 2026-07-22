@@ -21,6 +21,7 @@ class AlertEntry:
     area_desc: str
     url: str
     polygon: Optional[Polygon] = None
+    ends: str = ""
 
 
 class AlertsStore:
@@ -76,6 +77,7 @@ class AlertsStore:
                         "severity": a.severity,
                         "effective": a.effective,
                         "expires": a.expires,
+                        "ends": a.ends,
                         "area_desc": a.area_desc,
                         "url": a.url,
                         "polygon": (
@@ -100,6 +102,7 @@ class AlertsStore:
                     severity=a["severity"],
                     effective=a["effective"],
                     expires=a["expires"],
+                    ends=a.get("ends", ""),
                     area_desc=a["area_desc"],
                     url=a["url"],
                     polygon=shape(a["polygon"]) if a.get("polygon") else None,

@@ -128,6 +128,15 @@ def _extract_polygons_from_cap(
         severity = _cap_text(info, "severity", ns)
         effective = _cap_text(info, "effective", ns) or _cap_text(info, "onset", ns)
         expires = _cap_text(info, "expires", ns)
+        # CAP does not have a standard <ends> element; NWS adds it as a
+        # <parameter> with valueName "NWSheadline" sibling "eventEndingTime".
+        # For non-NWS CAP feeds, ends stays empty.
+        ends = ""
+        for param in info.findall("cap:parameter" if ns else "parameter", ns):
+            vn = (param.findtext("cap:valueName" if ns else "valueName", "", ns) or "").strip()
+            if vn == "eventEndingTime":
+                ends = (param.findtext("cap:value" if ns else "value", "", ns) or "").strip()
+                break
 
         for area in info.findall("cap:area" if ns else "area", ns):
             area_desc = (
@@ -183,6 +192,7 @@ def _extract_polygons_from_cap(
                                 severity=severity,
                                 effective=effective,
                                 expires=expires,
+                                ends=ends,
                                 area_desc=area_desc,
                                 url=cap_url,
                                 polygon=poly,
@@ -212,6 +222,7 @@ def _extract_polygons_from_cap(
                                 severity=severity,
                                 effective=effective,
                                 expires=expires,
+                                ends=ends,
                                 area_desc=area_desc,
                                 url=cap_url,
                                 polygon=poly,
@@ -494,9 +505,10 @@ class WMOAlertsFetcher:
             event_text = headline or event or ""
             description_text = description or headline or ""
 
-            # Effective/expires
+            # Effective/expires/ends
             effective = props.get("effective", "")
             expires = props.get("expires", "")
+            ends = props.get("ends", "")
 
             idx = len(entries)
             entries.append(
@@ -507,6 +519,7 @@ class WMOAlertsFetcher:
                     severity=props.get("severity", "Unknown"),
                     effective=effective,
                     expires=expires,
+                    ends=ends,
                     area_desc=props.get("areaDesc", ""),
                     url=props.get("id", "") or feature.get("id", ""),
                     polygon=polygon,

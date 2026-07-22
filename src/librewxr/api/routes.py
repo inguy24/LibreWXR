@@ -713,9 +713,16 @@ def _parse_cap_time(value: str) -> int | None:
 
 
 def _alert_not_expired(alert, now_utc: int) -> bool:
-    """Check if alert has not expired. Returns True for alerts without expires field."""
-    expires = _parse_cap_time(alert.expires)
-    return expires is None or expires > now_utc
+    """Check if alert event has not ended.
+
+    Prefers `ends` (expected event end time) over `expires` (CAP message
+    expiry).  CAP `expires` is when the alert *message* should be refreshed,
+    not when the hazard ends — filtering on it prematurely removes alerts
+    whose event is still active (e.g. a High Surf Advisory with a 2 PM
+    message expiry but an 11 PM event end).
+    """
+    end_time = _parse_cap_time(alert.ends) or _parse_cap_time(alert.expires)
+    return end_time is None or end_time > now_utc
 
 
 async def _fetch_nws_point_alerts(lat: float, lon: float) -> list[GeoJSONFeature]:
@@ -773,6 +780,7 @@ async def _fetch_nws_point_alerts(lat: float, lon: float) -> list[GeoJSONFeature
                     severity=props.get("severity", "Unknown"),
                     time=_parse_cap_time(props.get("effective", "")),
                     expires=_parse_cap_time(props.get("expires", "")),
+                    ends=_parse_cap_time(props.get("ends", "")),
                     description=desc,
                     regions=[props.get("areaDesc", "")] if props.get("areaDesc") else [],
                     uri=props.get("id", "") or feature.get("id", ""),
@@ -858,6 +866,7 @@ async def get_alerts(
                     severity=alert.severity,
                     time=_parse_cap_time(alert.effective),
                     expires=_parse_cap_time(alert.expires),
+                    ends=_parse_cap_time(alert.ends),
                     description=alert.description,
                     regions=[alert.area_desc] if alert.area_desc else [],
                     uri=uri,

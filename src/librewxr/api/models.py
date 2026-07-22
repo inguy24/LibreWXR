@@ -10,6 +10,7 @@ class AlertProperties(BaseModel):
     severity: str
     time: int | None
     expires: int | None
+    ends: int | None
     description: str
     regions: list[str]
     uri: str
