@@ -101,6 +101,13 @@ class GeoSatSource:
         self.name = self.friendly_name
         self._frames: dict[int, np.ndarray] = {}
         self._sorted_timestamps: list[int] = []
+        # ts -> the S3 key that produced the stored frame.  Not persisted
+        # to the snapshot/disk cache (see __setstate__ / _load_cached_frames);
+        # a frame resident from a restore has no entry here until adopted.
+        self._frame_keys: dict[int, str] = {}
+        # Timestamps whose frame was replaced by a newer reprocessed scan
+        # since the last consume_replaced_timestamps() call.
+        self._replaced_timestamps: list[int] = []
         self._fs: fsspec.AbstractFileSystem | None = None
         self._max_frames = max_frames
         self._bbox = bbox
@@ -171,6 +178,21 @@ class GeoSatSource:
             return False
 
     def _fetch_sync(self) -> bool:
+        """List, dedupe/trim, and ingest new or reprocessed frames.
+
+        Per-timestamp key choice is latest-wins: NOAA zero-pads the ``_c``
+        creation token, so the lexicographically largest key for a given
+        timestamp is the most recently created (and, for a republish, the
+        reprocessed/corrected product). A resident timestamp whose newly
+        listed key is newer than the one on record is re-downloaded and
+        replaces the stored frame (see ``consume_replaced_timestamps``).
+        A resident timestamp with no recorded key (restored from the disk
+        cache / cross-worker snapshot, where ``_frame_keys`` isn't
+        persisted) silently adopts the listed key instead of
+        re-downloading — this also means a republish that happened
+        entirely while this process was down is accepted as missed rather
+        than retroactively detected.
+        """
         fs = self._get_fs()
         now = datetime.now(timezone.utc)
         window_hours = max(1, (self._max_frames * self._effective_cadence_minutes) // 60 + 1)
@@ -184,31 +206,56 @@ class GeoSatSource:
         # loop immediately after ingest, so downloading it is pure waste.
         # The generous listing window above is still needed to refill the
         # store after restarts/gaps — window_hours is unchanged.
-        # Dedupe by timestamp BEFORE trimming: a republished scan (same _s
-        # start token, different key) must not consume a retention slot and
-        # push out a genuinely newer distinct timestamp. First key per
-        # timestamp wins, matching the ingest loop's own dedup order.
-        first_key_by_ts: dict[int, str] = {}
+        # Dedupe by timestamp BEFORE trimming, latest key per timestamp
+        # winning (see method docstring), so a republish doesn't consume
+        # an extra retention slot and push out a genuinely newer distinct
+        # timestamp.
+        best_key_by_ts: dict[int, str] = {}
         for unix_ts, s3_key in sorted(keys):
-            first_key_by_ts.setdefault(unix_ts, s3_key)
-        keys = sorted(first_key_by_ts.items())[-self._max_frames :]
+            best_key_by_ts[unix_ts] = s3_key
+        keys = sorted(best_key_by_ts.items())[-self._max_frames :]
 
+        replaced: list[int] = []
         new_count = 0
         for unix_ts, s3_key in keys:
-            if unix_ts in self._frames:
+            if unix_ts not in self._frames:
+                arr = self._download_and_decode(fs, s3_key)
+                if arr is None:
+                    continue
+                self._frames[unix_ts] = arr
+                self._frame_keys[unix_ts] = s3_key
+                new_count += 1
+                if self._channel_cache_dir is not None:
+                    self._write_cache(unix_ts, arr)
                 continue
+
+            recorded_key = self._frame_keys.get(unix_ts)
+            if recorded_key is None:
+                # Resident from a disk-cache/snapshot restore — key
+                # unknown. Adopt the listed key without re-downloading.
+                self._frame_keys[unix_ts] = s3_key
+                continue
+            if s3_key <= recorded_key:
+                continue  # already have this (or an older) key
+
             arr = self._download_and_decode(fs, s3_key)
             if arr is None:
                 continue
             self._frames[unix_ts] = arr
-            new_count += 1
+            self._frame_keys[unix_ts] = s3_key
             if self._channel_cache_dir is not None:
                 self._write_cache(unix_ts, arr)
+            replaced.append(unix_ts)
+            logger.info(
+                "%s: replaced reprocessed frame ts=%d (%s)",
+                self.friendly_name, unix_ts, s3_key,
+            )
 
         self._sorted_timestamps = sorted(self._frames)
         while len(self._sorted_timestamps) > self._max_frames:
             oldest = self._sorted_timestamps.pop(0)
             self._frames.pop(oldest, None)
+            self._frame_keys.pop(oldest, None)
             if self._channel_cache_dir is not None:
                 self._cache_path_for(oldest).unlink(missing_ok=True)
 
@@ -217,7 +264,18 @@ class GeoSatSource:
                 "%s: ingested %d new frame(s); store holds %d",
                 self.friendly_name, new_count, len(self._sorted_timestamps),
             )
-        return new_count > 0
+        self._replaced_timestamps.extend(replaced)
+        return new_count > 0 or bool(replaced)
+
+    def consume_replaced_timestamps(self) -> list[int]:
+        """Return and clear timestamps replaced by a newer reprocessed scan.
+
+        Consumed by the fetcher to invalidate stale tile-cache entries for
+        those timestamps after a successful fetch.
+        """
+        replaced = self._replaced_timestamps
+        self._replaced_timestamps = []
+        return replaced
 
     def _list_recent_keys(
         self,
@@ -695,6 +753,8 @@ class GeoSatSource:
         self._downsample_factor = state.get("downsample_factor", 1)
         self._frames = {}
         self._sorted_timestamps = []
+        self._frame_keys = {}
+        self._replaced_timestamps = []
         self._fs = None
         self._x_vec = None
         self._y_vec = None

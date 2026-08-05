@@ -71,6 +71,29 @@ class TileCache:
                 self._total_bytes -= _size_of(self._cache[k])
                 del self._cache[k]
 
+    def invalidate_satellite_timestamp(self, timestamp: int) -> None:
+        """Remove satellite entries for a timestamp, across both key shapes.
+
+        Satellite cache keys come in two shapes (both produced by the tile
+        warmer and consumed at render time — see api/routes.py:608/622):
+        single-family ``("sat", backing, ts, z, x, y, tile_size, ext)``
+        (timestamp at index 2) and multi-family
+        ``("sat", "multi", tag, ts, z, x, y, tile_size, ext)`` (timestamp
+        at index 3). ``invalidate_timestamp`` above only matches ``k[0]``
+        and so never reaches these (index 0 is always the literal "sat").
+        Checking membership in ``k[2:4]`` covers both shapes at once;
+        positions 2-3 are always ``(str, int)`` in both shapes, so int
+        membership cannot false-positive on the string fields.
+        """
+        with self._lock:
+            keys_to_remove = [
+                k for k in self._cache
+                if len(k) >= 4 and k[0] == "sat" and timestamp in k[2:4]
+            ]
+            for k in keys_to_remove:
+                self._total_bytes -= _size_of(self._cache[k])
+                del self._cache[k]
+
     def clear(self) -> None:
         with self._lock:
             self._cache.clear()

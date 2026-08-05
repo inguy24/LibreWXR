@@ -397,6 +397,16 @@ class RadarFetcher:
             return
         release_memory()
         if new_frames:
+            # Invalidate tile-cache entries for any timestamp whose frame
+            # was replaced by a newer reprocessed scan, before the warm
+            # fires — otherwise the warm would skip those tiles as
+            # already-cached instead of re-rendering the corrected data.
+            consume_replaced = getattr(
+                contrib.instance, "consume_replaced_timestamps", None,
+            )
+            if consume_replaced is not None and self._cache is not None:
+                for ts in consume_replaced():
+                    self._cache.invalidate_satellite_timestamp(ts)
             await self._fire_cycle_complete()
             if self._warmer is not None:
                 asyncio.create_task(self._warmer.warm_satellite())
