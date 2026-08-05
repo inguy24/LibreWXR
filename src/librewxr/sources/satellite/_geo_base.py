@@ -180,6 +180,12 @@ class GeoSatSource:
             logger.warning("%s: no S3 keys in retention window", self.friendly_name)
             return False
 
+        # Any key beyond the newest max_frames would be evicted by the trim
+        # loop immediately after ingest, so downloading it is pure waste.
+        # The generous listing window above is still needed to refill the
+        # store after restarts/gaps — window_hours is unchanged.
+        keys = sorted(keys)[-self._max_frames :]
+
         new_count = 0
         for unix_ts, s3_key in keys:
             if unix_ts in self._frames:
@@ -526,10 +532,12 @@ class GeoSatSource:
         x_step = (self._x_vec[-1] - self._x_vec[0]) / (self._grid_width - 1)
         y_step = (self._y_vec[0] - self._y_vec[-1]) / (self._grid_height - 1)
 
-        col = ((x_ang - self._x_vec[0]) / x_step).astype(np.int32)
-        row = ((self._y_vec[0] - y_ang) / y_step).astype(np.int32)
-
         visible = ~(np.isnan(x_ang) | np.isnan(y_ang))
+        x_safe = np.where(visible, x_ang, 0.0)
+        y_safe = np.where(visible, y_ang, 0.0)
+        col = ((x_safe - self._x_vec[0]) / x_step).astype(np.int32)
+        row = ((self._y_vec[0] - y_safe) / y_step).astype(np.int32)
+
         in_bounds = (
             visible
             & (row >= 0) & (row < self._grid_height)

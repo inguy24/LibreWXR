@@ -56,6 +56,8 @@ class TileWarmer:
         self._past_warm_complete = False
         self._nowcast_warm_complete = False
         self._warm_task: asyncio.Task | None = None
+        self._satellite_warm_running: bool = False
+        self._satellite_warm_rerun: bool = False
 
     def trigger_warm(self, frame_type: str = "both") -> None:
         """Trigger lazy overview warming from a user tile request.
@@ -511,6 +513,28 @@ class TileWarmer:
         )
 
     async def warm_satellite(self) -> None:
+        """Coalesce concurrent satellite warm requests into a single pass.
+
+        Concurrent calls coalesce; a call arriving mid-warm schedules
+        exactly one trailing pass so frames ingested by the second family
+        after the first pass indexed its grids are still warmed (the
+        trailing pass is mostly cache-skips). Single-threaded asyncio:
+        plain bools are safe, no lock needed.
+        """
+        if self._satellite_warm_running:
+            self._satellite_warm_rerun = True
+            return
+        self._satellite_warm_running = True
+        try:
+            while True:
+                self._satellite_warm_rerun = False
+                await self._warm_satellite_once()
+                if not self._satellite_warm_rerun:
+                    break
+        finally:
+            self._satellite_warm_running = False
+
+    async def _warm_satellite_once(self) -> None:
         """Pre-render satellite tiles at overview zoom levels.
 
         Iterates satellite timestamps x overview tile coordinates, renders
