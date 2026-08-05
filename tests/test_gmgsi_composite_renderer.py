@@ -53,9 +53,24 @@ def test_lw_helper_zero_encoded_is_transparent():
 
 
 def test_lw_helper_below_threshold_is_transparent():
-    encoded = np.array([50, 80, 110], dtype=np.uint8)
+    """Values at/below the current cloud threshold (25, not the old 110
+    pre-38fcbfe/80a8bf1) are fully transparent; one value just above it
+    is nonzero.
+
+    Current constants: _LW_CLOUD_THRESHOLD=25.0, _LW_CLOUD_MAX=140.0.
+    For 30 (just above threshold):
+        ramp = (30 - 25) / (140 - 25) = 5 / 115 ≈ 0.043478
+        alpha = ramp ** 0.7 ≈ 0.11138
+    """
+    encoded = np.array([5, 15, 25], dtype=np.uint8)
     _, alpha = _lw_brightness_and_alpha(encoded)
     assert np.all(alpha == 0.0)
+
+    above = np.array([30], dtype=np.uint8)
+    _, alpha_above = _lw_brightness_and_alpha(above)
+    expected = ((30.0 - 25.0) / (140.0 - 25.0)) ** 0.7
+    assert alpha_above[0] == pytest.approx(expected)
+    assert alpha_above[0] > 0.0
 
 
 def test_lw_helper_at_max_is_fully_opaque():
@@ -147,7 +162,21 @@ def test_lw_only_renderer_returns_valid_png():
 
 
 def test_lw_only_renderer_below_threshold_is_transparent():
-    lw = _ConstantSource(50)  # warm ground
+    """Below the current threshold (25, not the old 110): fully transparent.
+    Just above it (30): nonzero, hand-computed truncated uint8 alpha.
+
+    ramp = (30-25)/(140-25) = 5/115 ≈ 0.043478; alpha = ramp**0.7 ≈ 0.11138.
+    ``_pack_rgba`` truncates alpha*255 to uint8 (not rounds):
+    int(0.11138 * 255) == 28. Verified against the real render pipeline
+    (this tile z/x/y sits well inside the disk, so the edge-feather
+    multiplier is 1.0 and doesn't perturb the value — see module docstring).
+    """
+    lw = _ConstantSource(20)  # below current threshold (25)
     png = render_gmgsi_tile(lw, z=2, x=2, y=1, tile_size=32)
     rgba = _decode_png(png)
     assert np.all(rgba[..., 3] == 0)
+
+    lw_above = _ConstantSource(30)  # just above current threshold
+    png_above = render_gmgsi_tile(lw_above, z=2, x=2, y=1, tile_size=32)
+    rgba_above = _decode_png(png_above)
+    assert np.all(rgba_above[..., 3] == 28)

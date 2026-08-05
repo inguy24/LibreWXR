@@ -79,6 +79,17 @@ def test_provider_returns_goes18_for_socal():
     settings.goes_ir_enabled = True
     settings.goes_vis_enabled = True
     settings.satellite_max_frames = 12
+    # Real integers, not MagicMock's auto-vivified attrs: the provider
+    # compares these with `> 0` (goes_max_frames=0 exercises the
+    # satellite_max_frames-default path; satellite_cadence=0 exercises
+    # the class-default cadence path).
+    settings.goes_max_frames = 0
+    settings.satellite_cadence = 0
+    # Pins the single-satellite center-longitude path this test exercises;
+    # the default multi-family disk-overlap selection (ADR-079) would
+    # return both GOES-18 and GOES-19 for this bbox (both disks overlap
+    # it) and is deliberately not under test here.
+    settings.multi_satellite = False
 
     contribs = satellite_provider(settings, cache_dir=None)
     assert len(contribs) == 2
@@ -96,6 +107,13 @@ def test_provider_returns_goes19_for_nyc():
     settings.goes_ir_enabled = True
     settings.goes_vis_enabled = True
     settings.satellite_max_frames = 12
+    settings.goes_max_frames = 0
+    settings.satellite_cadence = 0
+    # Pins the single-satellite center-longitude path this test exercises;
+    # the default multi-family disk-overlap selection (ADR-079) would
+    # return both GOES-18 and GOES-19 for this bbox (both disks overlap
+    # it) and is deliberately not under test here.
+    settings.multi_satellite = False
 
     contribs = satellite_provider(settings, cache_dir=None)
     assert len(contribs) == 2
@@ -147,6 +165,12 @@ def test_provider_uses_station_lon_fallback():
     settings.goes_ir_enabled = True
     settings.goes_vis_enabled = False
     settings.satellite_max_frames = 12
+    # Real integers, not MagicMock's auto-vivified attrs: the provider
+    # compares these with `> 0` (goes_max_frames=0 exercises the
+    # satellite_max_frames-default path; satellite_cadence=0 exercises
+    # the class-default cadence path).
+    settings.goes_max_frames = 0
+    settings.satellite_cadence = 0
 
     contribs = satellite_provider(settings, cache_dir=None)
     assert len(contribs) == 1
@@ -221,11 +245,23 @@ def test_ir_cold_maps_to_high_uint8():
 
 
 def test_ir_warm_maps_to_low_uint8():
-    """Warm temperatures (ground) should map to low uint8 values."""
+    """Warm temperatures (ground) should map to low uint8 values.
+
+    _IR_T_MAX was extended from 320 K to 340 K (commit 2dcaa98, per NOAA
+    ABI spec) — 340 K, not 320 K, is now the ceiling that maps to 0.
+    320 K is hand-computed from the current formula constants
+    (_IR_T_MIN=170, _IR_T_MAX=340, _IR_RANGE=170):
+        encoded = 255 * (340 - 320) / 170 = 255 * 20 / 170 = 30.0 -> 30
+    Hardcoded so future drift in the constants fails loudly here.
+    """
     src = GOES18IRSource(cache_dir=None)
-    warm = np.array([[320.0]])  # T_MAX → should be 0
-    encoded = src._map_to_uint8(warm)
+    hottest = np.array([[340.0]])  # current T_MAX → should be 0
+    encoded = src._map_to_uint8(hottest)
     assert encoded[0, 0] == 0
+
+    warm = np.array([[320.0]])
+    encoded_warm = src._map_to_uint8(warm)
+    assert encoded_warm[0, 0] == 30
 
 
 def test_ir_nan_maps_to_zero():
@@ -286,10 +322,18 @@ class TestBBOXCrop:
     """BBOX crop for geostationary sources."""
 
     def test_crop_reduces_grid_dimensions(self):
-        """With a BBOX, grid should be much smaller than full CONUS."""
+        """With a BBOX, grid should be much smaller than full CONUS.
+
+        x_vec span corrected to the ABI fixed-grid convention (x increases
+        EASTWARD; commit 0bd6a99) — this SoCal bbox projects from GOES-18
+        (-137°W) to x in [0.0395, 0.0555] rad (measured via geo_forward on
+        the bbox corners), which the old x_vec (-0.10…+0.02) didn't cover
+        at all. New span -0.02…+0.13 rad covers it with margin; y_vec is
+        unchanged (already covers the corners' y in [0.0902, 0.0987]).
+        """
         bbox = (32.0, -120.5, 35.5, -114.5)
         src = GOES18IRSource(cache_dir=None, max_frames=3, bbox=bbox)
-        src._x_vec = np.linspace(-0.10, 0.02, 2500, dtype=np.float64)
+        src._x_vec = np.linspace(-0.02, 0.13, 2500, dtype=np.float64)
         src._y_vec = np.linspace(0.12, 0.04, 1500, dtype=np.float64)
         src._grid_width = 2500
         src._grid_height = 1500
@@ -334,11 +378,16 @@ class TestBBOXCrop:
         assert 0 <= src._crop_col_start < src._crop_col_end <= full_w
 
     def test_sample_returns_zero_outside_cropped_bbox(self):
-        """After BBOX crop, sample() should return 0 for points outside."""
+        """After BBOX crop, sample() should return 0 for points outside.
+
+        x_vec span corrected to the ABI fixed-grid convention (x increases
+        EASTWARD; commit 0bd6a99), same reasoning as
+        test_crop_reduces_grid_dimensions above.
+        """
         bbox = (32.0, -120.5, 35.5, -114.5)
         src = GOES18IRSource(cache_dir=None, max_frames=3, bbox=bbox)
         # Set up a full grid, then crop
-        full_x = np.linspace(-0.10, 0.02, 500, dtype=np.float64)
+        full_x = np.linspace(-0.02, 0.13, 500, dtype=np.float64)
         full_y = np.linspace(0.12, 0.04, 400, dtype=np.float64)
         src._compute_crop_indices(full_x, full_y, 500, 400)
         assert src._crop_computed

@@ -7,6 +7,8 @@ round-trip accuracy, and correct NaN handling for off-disk points.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -42,13 +44,18 @@ class TestForwardProjection:
         assert float(y[0]) > 0.0
         assert abs(float(x[0])) < 1e-6  # same longitude → x ≈ 0
 
-    def test_east_of_subsatellite_gives_negative_x(self):
-        """A point east of the sub-satellite should have x < 0 (GOES convention)."""
+    def test_east_of_subsatellite_gives_positive_x(self):
+        """A point east of the sub-satellite should have x > 0.
+
+        GOES-R ABI fixed-grid convention: the x scan angle increases
+        EASTWARD (commit 0bd6a99). E.g. GOES-East CONUS sector's
+        documented x extent is roughly -0.101332...+0.038612 rad — west
+        negative, east positive.
+        """
         lat = np.array([0.0])
         lon = np.array([SAT_LON + 10.0])
         x, y = forward(lat, lon, SAT_LON, SAT_HEIGHT)
-        # x = arcsin(-sy/r), and sy is negative for east → x < 0
-        assert float(x[0]) < 0.0
+        assert float(x[0]) > 0.0
 
     def test_far_side_of_earth_returns_nan(self):
         """Points on the opposite side of the earth (behind it) return NaN."""
@@ -73,6 +80,58 @@ class TestForwardProjection:
         x, y = forward(lat, lon, SAT_LON, SAT_HEIGHT)
         assert x.shape == (10, 10)
         assert y.shape == (10, 10)
+
+
+def _spherical_scan_angle_approx(
+    lat_deg: float, lon_deg: float, sat_lon_deg: float, sat_height_m: float,
+) -> tuple[float, float]:
+    """Independent scan-angle approximation using a spherical Earth.
+
+    Deliberately does NOT share any code or constants with
+    ``librewxr.tiles.geostationary.forward`` — no WGS84 ellipsoid axes,
+    no geocentric-latitude correction, just a single mean Earth radius
+    and plain spherical trigonometry. Not meant to match precisely (the
+    real kernel accounts for ellipsoidal flattening); only meant to
+    catch sign flips and gross scale errors in the kernel.
+    """
+    r_mean = 6_371_000.0  # mean Earth radius (m) — NOT geo_forward's R_EQ/R_POL
+    phi = math.radians(lat_deg)
+    lam = math.radians(lon_deg - sat_lon_deg)
+    h = sat_height_m + r_mean
+
+    sx = h - r_mean * math.cos(phi) * math.cos(lam)
+    sy = -r_mean * math.cos(phi) * math.sin(lam)
+    sz = r_mean * math.sin(phi)
+
+    r_s = math.sqrt(sx**2 + sy**2 + sz**2)
+    x = math.asin(-sy / r_s)
+    y = math.atan2(sz, sx)
+    return x, y
+
+
+def test_forward_known_answer_against_independent_spherical_approx():
+    """Known-answer test: geo_forward vs. an independent approximation.
+
+    Kernel unchanged this round — this is a non-falsifiable-vs-pre-change
+    pin, added per the KAT mandate for numerical kernels as they are
+    touched (rules/verification.md). Point: 33.0°N, -117.5°W (SoCal)
+    from GOES-18 (-137.0°W). Tolerance is loose (15% relative + matching
+    signs) because the approximation ignores ellipsoidal flattening;
+    measured agreement is ~0.2-0.4%, so 15% leaves headroom while still
+    catching a sign flip or a gross scale error.
+    """
+    lat, lon = 33.0, -117.5
+    x_kernel, y_kernel = forward(
+        np.array([lat]), np.array([lon]), SAT_LON, SAT_HEIGHT,
+    )
+    x_approx, y_approx = _spherical_scan_angle_approx(
+        lat, lon, SAT_LON, SAT_HEIGHT,
+    )
+
+    assert (float(x_kernel[0]) > 0) == (x_approx > 0)
+    assert (float(y_kernel[0]) > 0) == (y_approx > 0)
+    assert float(x_kernel[0]) == pytest.approx(x_approx, rel=0.15)
+    assert float(y_kernel[0]) == pytest.approx(y_approx, rel=0.15)
 
 
 class TestInverseProjection:

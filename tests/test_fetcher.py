@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
 import asyncio
+import sys
 
 import numpy as np
 import pytest
@@ -429,6 +430,11 @@ class TestCarryForward:
             assert "TESTREG" not in far_frame.regions
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="numpy memmap file locking: Windows cannot unlink/replace "
+        "mapped files; production runtime is Linux-only (Docker)",
+    )
     async def test_successful_refetch_overrides_carried_data(
         self, small_region,
     ):

@@ -8,6 +8,7 @@ Pure unit tests — no S3 network calls.  Live fetch against the
 """
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timezone
 
 import numpy as np
@@ -770,6 +771,11 @@ class TestSnowMaskPersistence:
         await g.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="numpy memmap file locking: Windows cannot unlink/replace "
+        "mapped files; production runtime is Linux-only (Docker)",
+    )
     async def test_eviction_removes_snow_files_too(self, tmp_path):
         run_ts = int(datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc).timestamp())
         g = HRRRAlaskaGrid(cache_dir=tmp_path)

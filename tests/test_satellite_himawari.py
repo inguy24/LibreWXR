@@ -49,6 +49,12 @@ def test_provider_returns_himawari_for_tokyo():
     settings.himawari_ir_enabled = True
     settings.himawari_vis_enabled = True
     settings.satellite_max_frames = 12
+    # Real integers, not MagicMock's auto-vivified attrs: the provider
+    # compares these with `> 0` (himawari_max_frames=0 exercises the
+    # satellite_max_frames-default path; satellite_cadence=0 exercises
+    # the class-default cadence path).
+    settings.himawari_max_frames = 0
+    settings.satellite_cadence = 0
 
     contribs = satellite_provider(settings, cache_dir=None)
     assert len(contribs) == 2
@@ -65,6 +71,8 @@ def test_provider_returns_himawari_for_sydney():
     settings.himawari_ir_enabled = True
     settings.himawari_vis_enabled = True
     settings.satellite_max_frames = 12
+    settings.himawari_max_frames = 0
+    settings.satellite_cadence = 0
 
     contribs = satellite_provider(settings, cache_dir=None)
     assert len(contribs) == 2
@@ -116,6 +124,8 @@ def test_provider_uses_station_lon():
     settings.himawari_ir_enabled = True
     settings.himawari_vis_enabled = False
     settings.satellite_max_frames = 12
+    settings.himawari_max_frames = 0
+    settings.satellite_cadence = 0
 
     contribs = satellite_provider(settings, cache_dir=None)
     assert len(contribs) == 1
@@ -133,10 +143,20 @@ def test_ir_cold_maps_to_high():
 
 
 def test_ir_warm_maps_to_low():
+    """_IR_T_MAX is 340 K (same NOAA ABI spec as GOES) — that, not 320 K,
+    is the ceiling that maps to 0. 320 K hand-computed from the current
+    formula constants (_IR_T_MIN=170, _IR_T_MAX=340, _IR_RANGE=170):
+        encoded = 255 * (340 - 320) / 170 = 255 * 20 / 170 = 30.0 -> 30
+    Hardcoded so future drift in the constants fails loudly here.
+    """
     src = HimawariIRSource(cache_dir=None)
-    warm = np.array([[320.0]])
-    encoded = src._map_to_uint8(warm)
+    hottest = np.array([[340.0]])
+    encoded = src._map_to_uint8(hottest)
     assert encoded[0, 0] == 0
+
+    warm = np.array([[320.0]])
+    encoded_warm = src._map_to_uint8(warm)
+    assert encoded_warm[0, 0] == 30
 
 
 # ── VIS value mapping ──
