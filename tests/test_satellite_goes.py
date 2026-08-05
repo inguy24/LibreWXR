@@ -8,6 +8,7 @@ S3 I/O is mocked — live verification is a separate deployment step.
 """
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -381,3 +382,104 @@ def test_goes_source_renders_via_satellite_renderer():
     )
     assert len(tile_bytes) > 0
     assert tile_bytes[:4] == b"\x89PNG"
+
+
+# ── G1: retention-window trim (guard for D1) ──
+
+
+def test_fetch_sync_skips_out_of_retention_keys(monkeypatch):
+    """Keys beyond the newest ``max_frames`` must not be downloaded.
+
+    Any key older than the newest ``max_frames`` would be evicted by the
+    trim loop immediately after ingest, so downloading it is pure waste.
+    Pre-change, ``_fetch_sync`` downloads every listed key not already in
+    ``self._frames`` before trimming: a partially-warm store still
+    re-downloads out-of-retention keys, and an empty store downloads
+    everything listed instead of just the newest ``max_frames``.
+    """
+    src = GOES18IRSource(cache_dir=None, max_frames=4)
+    src._fs = MagicMock()  # _get_fs() short-circuits when _fs is already set
+
+    keys = [(1_700_000_000 + i * 300, f"key{i}") for i in range(10)]  # ascending
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: keys)
+
+    call_count = 0
+
+    def fake_download(fs, s3_key):
+        nonlocal call_count
+        call_count += 1
+        return np.zeros((2, 2), dtype=np.uint8)
+
+    monkeypatch.setattr(src, "_download_and_decode", fake_download)
+
+    # Store already holds the newest 4 timestamps — nothing new to fetch.
+    newest_4 = [ts for ts, _ in keys[-4:]]
+    for ts in newest_4:
+        src._frames[ts] = np.zeros((2, 2), dtype=np.uint8)
+    src._sorted_timestamps = sorted(src._frames)
+
+    src._fetch_sync()
+
+    assert call_count == 0, (
+        f"expected 0 downloads for an already-warm store, got {call_count}"
+    )
+    assert sorted(src._frames) == newest_4
+
+    # Empty store: only the newest max_frames keys should be downloaded,
+    # not every key in the (deliberately generous) listing window.
+    src2 = GOES18IRSource(cache_dir=None, max_frames=4)
+    src2._fs = MagicMock()
+    monkeypatch.setattr(src2, "_list_recent_keys", lambda fs, start, end: keys)
+
+    call_count2 = 0
+
+    def fake_download2(fs, s3_key):
+        nonlocal call_count2
+        call_count2 += 1
+        return np.zeros((2, 2), dtype=np.uint8)
+
+    monkeypatch.setattr(src2, "_download_and_decode", fake_download2)
+
+    src2._fetch_sync()
+
+    assert call_count2 == 4, (
+        f"expected 4 downloads (newest max_frames only) for an empty store, "
+        f"got {call_count2}"
+    )
+    assert sorted(src2._frames) == newest_4
+
+
+# ── G3: NaN-safe sample() cast (guard for D3) ──
+
+
+def test_sample_no_runtime_warning_on_mixed_visibility():
+    """sample() must not raise RuntimeWarning casting NaN scan angles.
+
+    Baseline casts ``x_ang``/``y_ang`` (containing NaN for off-disk points)
+    to int32 *before* the ``visible`` mask is applied, which raises
+    ``RuntimeWarning: invalid value encountered in cast`` under a strict
+    warnings filter. The fix must not change any visible-point output.
+    """
+    src = GOES18IRSource(cache_dir=None, max_frames=3)
+    src._x_vec = np.linspace(-0.10, 0.10, 100, dtype=np.float64)
+    src._y_vec = np.linspace(0.10, -0.10, 100, dtype=np.float64)
+    src._grid_width = 100
+    src._grid_height = 100
+
+    grid = np.full((100, 100), 200, dtype=np.uint8)
+    ts = 12345
+    src._frames[ts] = grid
+    src._sorted_timestamps = [ts]
+
+    # LA is visible from GOES-18 (-137.0) and falls within this synthetic
+    # grid; ~43E is roughly antipodal and off-disk (same point used by
+    # test_sample_returns_zero_for_invisible_point above).
+    lat = np.array([34.0, 0.0], dtype=np.float64)
+    lon = np.array([-118.0, 43.0], dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        out = src.sample(lat, lon, timestamp=ts)
+
+    assert out[0] == 200, "visible point should sample the uniform grid value"
+    assert out[1] == 0, "off-disk point must stay 0"
