@@ -181,6 +181,42 @@ class TestTileGeometryCache:
         assert cache.get(key) is None
 
 
+class TestSatelliteInvalidation:
+    """G-R3d: satellite tile-cache entries come in two key shapes —
+    single-family ``("sat", backing, ts, ...)`` (routes.py:622, timestamp
+    at index 2) and multi-family ``("sat", "multi", tag, ts, ...)``
+    (routes.py:608, timestamp at index 3). Both are produced by the
+    warmer (``warmer.py`` — verified via grep during round-3 planning) and
+    consumed at render time, so invalidation must cover both.
+
+    Pre-change: ``invalidate_satellite_timestamp`` does not exist —
+    AttributeError.
+    """
+
+    def test_invalidate_satellite_timestamp_removes_both_key_shapes(self):
+        cache = TileCache(max_mb=10)
+        single_key = ("sat", "goes18_ir_grid", 1000, 3, 1, 2, 256, "png")
+        multi_key = ("sat", "multi", "goes18+goes19", 1000, 3, 1, 2, 256, "png")
+        # Radar-shaped key whose first element coincidentally equals the
+        # target timestamp — must NOT be touched (k[0] != "sat" excludes it).
+        radar_key = (1000, 3, 1, 2, 256, 1, 0)
+        other_ts_single = ("sat", "goes18_ir_grid", 2000, 3, 1, 2, 256, "png")
+        other_ts_multi = ("sat", "multi", "goes18+goes19", 2000, 3, 1, 2, 256, "png")
+
+        for k in (single_key, multi_key, radar_key, other_ts_single, other_ts_multi):
+            cache.put(k, b"x" * 10)
+        assert cache.total_bytes == 50
+
+        cache.invalidate_satellite_timestamp(1000)
+
+        assert cache.get(single_key) is None
+        assert cache.get(multi_key) is None
+        assert cache.get(radar_key) is not None
+        assert cache.get(other_ts_single) is not None
+        assert cache.get(other_ts_multi) is not None
+        assert cache.total_bytes == 30
+
+
 class TestBlurRadius:
     """Blur radius must scale with how many tile pixels a region pixel covers."""
 

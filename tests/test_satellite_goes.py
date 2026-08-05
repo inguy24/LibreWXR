@@ -507,8 +507,13 @@ def test_fetch_sync_duplicate_timestamp_key_does_not_evict_newer_frame(monkeypat
     tuple count lets the duplicate push a genuinely newer *distinct*
     timestamp out of the newest-``max_frames`` window, silently dropping a
     frame that should survive retention. The trim must count distinct
-    timestamps, first key per timestamp winning (the ingest loop's own
-    dedup order).
+    timestamps.
+
+    Tie-break for which key wins per timestamp: latest-created (round 3,
+    A1) — reversed from the first-key-wins tie-break this test originally
+    pinned, per lead ruling superseding the 60ffa81 remediation. The
+    dedupe-before-trim behavior under test here (distinct timestamps
+    surviving retention) is unchanged by that reversal.
     """
     src = GOES18IRSource(cache_dir=None, max_frames=5)
     src._fs = MagicMock()
@@ -537,8 +542,10 @@ def test_fetch_sync_duplicate_timestamp_key_does_not_evict_newer_frame(monkeypat
         f"{base + 4 * 300} must not push distinct ts {base + 300} out of "
         f"the newest-5 window"
     )
-    # First key per timestamp wins, matching the ingest loop's dedup order.
-    assert "key4" in downloaded and "key4-republished" not in downloaded
+    # Latest (lexicographically largest) key per timestamp wins (A1) —
+    # "key4-republished" > "key4" lexicographically, so the republished
+    # scan wins the slot, matching the ingest loop's own tie-break.
+    assert "key4-republished" in downloaded and "key4" not in downloaded
 
 
 # ── G3: NaN-safe sample() cast (guard for D3) ──
@@ -575,3 +582,168 @@ def test_sample_no_runtime_warning_on_mixed_visibility():
 
     assert out[0] == 200, "visible point should sample the uniform grid value"
     assert out[1] == 0, "off-disk point must stay 0"
+
+
+# ── G-R3a/b/c: reprocessed-scan adoption (guards for round-3 A1/A2) ──
+
+
+def test_fetch_sync_latest_key_wins_in_one_listing(monkeypatch):
+    """A1: when one listing has two keys for the same timestamp, the
+    lexicographically LARGEST (latest-created) key is downloaded — the
+    earlier key is never fetched.
+
+    Pre-change (first-key-wins): the earlier key is downloaded instead.
+    """
+    src = GOES18IRSource(cache_dir=None, max_frames=4)
+    src._fs = MagicMock()
+
+    ts = 1_700_000_000
+    early_key = "goes18_c20250101010101.nc"
+    late_key = "goes18_c20250101010999.nc"  # later _c creation token
+    keys = [(ts, early_key), (ts, late_key)]
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: keys)
+
+    downloaded: list[str] = []
+
+    def fake_download(fs, s3_key):
+        downloaded.append(s3_key)
+        return np.zeros((2, 2), dtype=np.uint8)
+
+    monkeypatch.setattr(src, "_download_and_decode", fake_download)
+
+    src._fetch_sync()
+
+    assert downloaded == [late_key], (
+        f"expected only the later key downloaded, got {downloaded}"
+    )
+
+
+def test_fetch_sync_replaces_resident_frame_with_newer_key(monkeypatch):
+    """A2: a later poll listing a newer key for an already-resident
+    timestamp triggers exactly one re-download; the frame data is
+    replaced; ``consume_replaced_timestamps()`` reports it exactly once,
+    then reports nothing on a subsequent poll with the same listing.
+
+    Pre-change: no ``consume_replaced_timestamps`` method — AttributeError
+    (a mechanics pin: the replacement machinery doesn't exist yet).
+    """
+    src = GOES18IRSource(cache_dir=None, max_frames=4)
+    src._fs = MagicMock()
+
+    ts = 1_700_000_000
+    key_a = "goes18_c20250101010101.nc"
+    key_b = "goes18_c20250101010999.nc"  # newer — reprocessed product
+
+    call_log: list[str] = []
+
+    def fake_download(fs, s3_key):
+        call_log.append(s3_key)
+        value = 11 if s3_key == key_a else 22  # distinguishable stub arrays
+        return np.full((2, 2), value, dtype=np.uint8)
+
+    monkeypatch.setattr(src, "_download_and_decode", fake_download)
+
+    # Poll 1: ingest ts with key_a.
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: [(ts, key_a)])
+    src._fetch_sync()
+    assert call_log == [key_a]
+    np.testing.assert_array_equal(
+        src._frames[ts], np.full((2, 2), 11, dtype=np.uint8),
+    )
+    assert src.consume_replaced_timestamps() == []
+
+    # Poll 2: listing now has key_b (newer) for the same ts.
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: [(ts, key_b)])
+    src._fetch_sync()
+    assert call_log == [key_a, key_b], "expected exactly one re-download"
+    np.testing.assert_array_equal(
+        src._frames[ts], np.full((2, 2), 22, dtype=np.uint8),
+    )
+    assert src.consume_replaced_timestamps() == [ts]
+
+    # Poll 3: same listing (key_b) again — no further download, no replacement.
+    src._fetch_sync()
+    assert call_log == [key_a, key_b], "no further download expected"
+    assert src.consume_replaced_timestamps() == []
+
+
+def test_fetch_sync_adopts_key_for_resident_frame_with_no_recorded_key(monkeypatch):
+    """A2: a frame resident from a disk-cache/snapshot restore (key
+    unknown — ``_frame_keys`` has no entry) adopts the listed key without
+    re-downloading. A subsequent poll with a NEWER key then triggers
+    replacement (the G-R3b behavior above).
+
+    Pre-change: no ``_frame_keys`` attribute — AttributeError.
+    """
+    src = GOES18IRSource(cache_dir=None, max_frames=4)
+    src._fs = MagicMock()
+
+    ts = 1_700_000_000
+    key_a = "goes18_c20250101010101.nc"
+    key_b = "goes18_c20250101010999.nc"
+
+    # Simulate a frame restored from disk cache: resident in _frames, but
+    # _frame_keys has no entry for it (key unknown).
+    src._frames[ts] = np.full((2, 2), 99, dtype=np.uint8)
+    src._sorted_timestamps = [ts]
+    assert ts not in src._frame_keys
+
+    call_log: list[str] = []
+
+    def fake_download(fs, s3_key):
+        call_log.append(s3_key)
+        return np.full((2, 2), 22, dtype=np.uint8)
+
+    monkeypatch.setattr(src, "_download_and_decode", fake_download)
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: [(ts, key_a)])
+
+    src._fetch_sync()
+
+    assert call_log == [], "adopting the key must not re-download"
+    assert src._frame_keys[ts] == key_a
+    np.testing.assert_array_equal(
+        src._frames[ts], np.full((2, 2), 99, dtype=np.uint8),
+    )  # untouched by the adopt
+    assert src.consume_replaced_timestamps() == []
+
+    # A subsequent poll with a newer key now triggers replacement.
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: [(ts, key_b)])
+    src._fetch_sync()
+    assert call_log == [key_b]
+    assert src.consume_replaced_timestamps() == [ts]
+
+
+# ── R3-B: multi-satellite default-path coverage (P2) ──
+
+
+def test_provider_returns_both_families_for_multi_satellite_default():
+    """Pins ADR-079's default disk-overlap selection: with
+    ``multi_satellite=True`` (the documented default) and a bbox visible
+    to both GOES-18 and GOES-19, ``satellite_provider()`` returns all 4
+    contributions (both families' IR + VIS). The repaired single-satellite
+    tests above (``test_provider_returns_goes18_for_socal`` etc.)
+    deliberately exclude this path via ``multi_satellite=False`` — this
+    test pins the default path they don't cover (parking-lot item P2).
+
+    New pin — non-falsifiable-vs-pre-change (no prior test covered this
+    path at all; it simply didn't exist before).
+    """
+    from librewxr.sources.satellite.goes import satellite_provider
+
+    settings = MagicMock()
+    settings.get_bbox.return_value = (32.0, -120.5, 35.5, -114.5)
+    settings.goes_enabled = True
+    settings.goes_ir_enabled = True
+    settings.goes_vis_enabled = True
+    settings.satellite_max_frames = 12
+    settings.goes_max_frames = 0
+    settings.satellite_cadence = 0
+    settings.multi_satellite = True
+
+    contribs = satellite_provider(settings, cache_dir=None)
+    assert len(contribs) == 4
+    slugs = {c.slug for c in contribs}
+    assert slugs == {
+        "goes18_ir_grid", "goes18_vis_grid",
+        "goes19_ir_grid", "goes19_vis_grid",
+    }
