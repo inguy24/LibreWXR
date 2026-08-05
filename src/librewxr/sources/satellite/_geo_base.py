@@ -184,7 +184,14 @@ class GeoSatSource:
         # loop immediately after ingest, so downloading it is pure waste.
         # The generous listing window above is still needed to refill the
         # store after restarts/gaps — window_hours is unchanged.
-        keys = sorted(keys)[-self._max_frames :]
+        # Dedupe by timestamp BEFORE trimming: a republished scan (same _s
+        # start token, different key) must not consume a retention slot and
+        # push out a genuinely newer distinct timestamp. First key per
+        # timestamp wins, matching the ingest loop's own dedup order.
+        first_key_by_ts: dict[int, str] = {}
+        for unix_ts, s3_key in sorted(keys):
+            first_key_by_ts.setdefault(unix_ts, s3_key)
+        keys = sorted(first_key_by_ts.items())[-self._max_frames :]
 
         new_count = 0
         for unix_ts, s3_key in keys:

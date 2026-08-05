@@ -519,7 +519,9 @@ class TileWarmer:
         exactly one trailing pass so frames ingested by the second family
         after the first pass indexed its grids are still warmed (the
         trailing pass is mostly cache-skips). Single-threaded asyncio:
-        plain bools are safe, no lock needed.
+        plain bools are safe, no lock needed. If the in-flight pass
+        raises, a queued trailing rerun is deferred to the next ingest
+        trigger (every fetch cycle) rather than retried immediately.
         """
         if self._satellite_warm_running:
             self._satellite_warm_rerun = True

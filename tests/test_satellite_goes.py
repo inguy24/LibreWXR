@@ -498,6 +498,49 @@ def test_fetch_sync_skips_out_of_retention_keys(monkeypatch):
     assert sorted(src2._frames) == newest_4
 
 
+def test_fetch_sync_duplicate_timestamp_key_does_not_evict_newer_frame(monkeypatch):
+    """A republished scan (same timestamp, second key) must not consume a
+    retention slot.
+
+    NOAA can republish a scan under a new S3 key with the same ``_s`` start
+    token (different ``_c`` creation token). Trimming the listing by raw
+    tuple count lets the duplicate push a genuinely newer *distinct*
+    timestamp out of the newest-``max_frames`` window, silently dropping a
+    frame that should survive retention. The trim must count distinct
+    timestamps, first key per timestamp winning (the ingest loop's own
+    dedup order).
+    """
+    src = GOES18IRSource(cache_dir=None, max_frames=5)
+    src._fs = MagicMock()
+
+    # 6 distinct timestamps; a LATE timestamp (i=4) is listed twice under
+    # different keys, so a raw tuple-count trim cuts a distinct older
+    # timestamp that belongs in the newest-5 window.
+    base = 1_700_000_000
+    keys = [(base + i * 300, f"key{i}") for i in range(6)]
+    keys.append((base + 4 * 300, "key4-republished"))
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: keys)
+
+    downloaded: list[str] = []
+
+    def fake_download(fs, s3_key):
+        downloaded.append(s3_key)
+        return np.zeros((2, 2), dtype=np.uint8)
+
+    monkeypatch.setattr(src, "_download_and_decode", fake_download)
+
+    src._fetch_sync()
+
+    expected_newest_5 = [base + i * 300 for i in range(1, 6)]
+    assert sorted(src._frames) == expected_newest_5, (
+        f"store holds {sorted(src._frames)}; the duplicate key for ts "
+        f"{base + 4 * 300} must not push distinct ts {base + 300} out of "
+        f"the newest-5 window"
+    )
+    # First key per timestamp wins, matching the ingest loop's dedup order.
+    assert "key4" in downloaded and "key4-republished" not in downloaded
+
+
 # ── G3: NaN-safe sample() cast (guard for D3) ──
 
 
