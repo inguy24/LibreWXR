@@ -216,6 +216,32 @@ class TestSatelliteInvalidation:
         assert cache.get(other_ts_multi) is not None
         assert cache.total_bytes == 30
 
+    def test_invalidate_does_not_match_zoom_equal_to_timestamp(self):
+        """Adversarial-audit finding: the single-family shape carries
+        ``(ts, z)`` at indices 2-3 — both ints — so a membership test over
+        ``k[2:4]`` also removes entries whose ZOOM equals the target
+        timestamp. The matcher must discriminate the shape (``k[1] ==
+        "multi"``), not scan a position range.
+        """
+        cache = TileCache(max_mb=10)
+        # ts=999999, z=7: must survive invalidate_satellite_timestamp(7).
+        victim = ("sat", "ir_only", 999999, 7, 3, 4, 512, "webp")
+        # Genuine ts=7 entries (unrealistic ts, but shape-legal): removed.
+        target_single = ("sat", "goes18_ir_grid", 7, 3, 1, 2, 256, "png")
+        target_multi = ("sat", "multi", "goes18+goes19", 7, 3, 1, 2, 256, "png")
+
+        for k in (victim, target_single, target_multi):
+            cache.put(k, b"x" * 10)
+
+        cache.invalidate_satellite_timestamp(7)
+
+        assert cache.get(victim) is not None, (
+            "entry with zoom == target timestamp must NOT be invalidated"
+        )
+        assert cache.get(target_single) is None
+        assert cache.get(target_multi) is None
+        assert cache.total_bytes == 10
+
 
 class TestBlurRadius:
     """Blur radius must scale with how many tile pixels a region pixel covers."""

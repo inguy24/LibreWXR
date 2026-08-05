@@ -215,7 +215,6 @@ class GeoSatSource:
             best_key_by_ts[unix_ts] = s3_key
         keys = sorted(best_key_by_ts.items())[-self._max_frames :]
 
-        replaced: list[int] = []
         new_count = 0
         for unix_ts, s3_key in keys:
             if unix_ts not in self._frames:
@@ -243,9 +242,14 @@ class GeoSatSource:
                 continue
             self._frames[unix_ts] = arr
             self._frame_keys[unix_ts] = s3_key
+            # Record the replacement the moment the in-memory frame changes,
+            # BEFORE the disk-cache write: once _frame_keys has advanced, no
+            # future poll can re-detect this replacement, so an exception
+            # later in this call (e.g. a failing _write_cache) must not be
+            # able to lose the pending tile-cache invalidation.
+            self._replaced_timestamps.append(unix_ts)
             if self._channel_cache_dir is not None:
                 self._write_cache(unix_ts, arr)
-            replaced.append(unix_ts)
             logger.info(
                 "%s: replaced reprocessed frame ts=%d (%s)",
                 self.friendly_name, unix_ts, s3_key,
@@ -264,8 +268,12 @@ class GeoSatSource:
                 "%s: ingested %d new frame(s); store holds %d",
                 self.friendly_name, new_count, len(self._sorted_timestamps),
             )
-        self._replaced_timestamps.extend(replaced)
-        return new_count > 0 or bool(replaced)
+        # Pending (unconsumed) replacements force the True path even when
+        # nothing new was ingested this poll: if a prior poll recorded a
+        # replacement and then raised before the fetcher could consume it,
+        # the next clean poll must still trigger the fetcher's
+        # consume-and-invalidate step.
+        return new_count > 0 or bool(self._replaced_timestamps)
 
     def consume_replaced_timestamps(self) -> list[int]:
         """Return and clear timestamps replaced by a newer reprocessed scan.

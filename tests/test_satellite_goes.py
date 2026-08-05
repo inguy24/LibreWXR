@@ -667,6 +667,69 @@ def test_fetch_sync_replaces_resident_frame_with_newer_key(monkeypatch):
     assert src.consume_replaced_timestamps() == []
 
 
+def test_replacement_survives_mid_loop_exception(monkeypatch, tmp_path):
+    """Adversarial-audit finding: a replacement's tile-cache invalidation
+    must survive an exception later in the same ``_fetch_sync`` call.
+
+    Once ``_frame_keys`` has advanced, no future poll can re-detect the
+    replacement — so if the pending-invalidation record were only merged
+    at the end of the function, an exception between the in-memory
+    replacement and that merge (e.g. a failing disk-cache write) would
+    leave corrected frame data in memory with its stale tiles served for
+    the rest of the frame's retention lifetime. The record must be
+    appended the moment the in-memory frame changes, and pending
+    unconsumed replacements must force the next clean poll to return True
+    so the fetcher's consume-and-invalidate step runs.
+    """
+    src = GOES18IRSource(cache_dir=None, max_frames=4)
+    src._fs = MagicMock()
+    src._channel_cache_dir = tmp_path  # enable the _write_cache path
+
+    ts1, ts2 = 1_700_000_000, 1_700_000_300
+    old1, old2 = "goes18_s1_c20250101010101.nc", "goes18_s2_c20250101010101.nc"
+    new1, new2 = "goes18_s1_c20250101010999.nc", "goes18_s2_c20250101010999.nc"
+
+    # Both timestamps resident with recorded (old) keys.
+    for ts, key, val in ((ts1, old1, 1), (ts2, old2, 2)):
+        src._frames[ts] = np.full((2, 2), val, dtype=np.uint8)
+        src._frame_keys[ts] = key
+    src._sorted_timestamps = sorted(src._frames)
+
+    monkeypatch.setattr(
+        src, "_download_and_decode",
+        lambda fs, s3_key: np.full((2, 2), 99, dtype=np.uint8),
+    )
+
+    # Disk-cache write raises on the SECOND replacement.
+    write_calls: list[int] = []
+
+    def raising_write(unix_ts, arr):
+        write_calls.append(unix_ts)
+        if len(write_calls) == 2:
+            raise PermissionError("disk cache write denied")
+
+    monkeypatch.setattr(src, "_write_cache", raising_write)
+    listing = [(ts1, new1), (ts2, new2)]
+    monkeypatch.setattr(src, "_list_recent_keys", lambda fs, start, end: listing)
+
+    with pytest.raises(PermissionError):
+        src._fetch_sync()
+
+    # Both in-memory replacements happened before the raise …
+    assert src._frame_keys[ts1] == new1 and src._frame_keys[ts2] == new2
+
+    # … so BOTH must already be recorded as pending invalidations.
+    # A follow-up clean poll (identical listing, nothing new to download)
+    # must return True purely because replacements are pending, so the
+    # fetcher consumes them.
+    monkeypatch.setattr(src, "_write_cache", lambda unix_ts, arr: None)
+    assert src._fetch_sync() is True, (
+        "pending unconsumed replacements must force the True path"
+    )
+    assert sorted(src.consume_replaced_timestamps()) == [ts1, ts2]
+    assert src.consume_replaced_timestamps() == []
+
+
 def test_fetch_sync_adopts_key_for_resident_frame_with_no_recorded_key(monkeypatch):
     """A2: a frame resident from a disk-cache/snapshot restore (key
     unknown — ``_frame_keys`` has no entry) adopts the listed key without

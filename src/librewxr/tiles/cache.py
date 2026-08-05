@@ -81,15 +81,24 @@ class TileCache:
         ``("sat", "multi", tag, ts, z, x, y, tile_size, ext)`` (timestamp
         at index 3). ``invalidate_timestamp`` above only matches ``k[0]``
         and so never reaches these (index 0 is always the literal "sat").
-        Checking membership in ``k[2:4]`` covers both shapes at once;
-        positions 2-3 are always ``(str, int)`` in both shapes, so int
-        membership cannot false-positive on the string fields.
+        The shape is discriminated on ``k[1] == "multi"`` — a membership
+        test over ``k[2:4]`` would be wrong, because the single-family
+        shape carries ``(ts, z)`` at those positions (both ints) and would
+        also match any entry whose zoom level equals the timestamp.
         """
         with self._lock:
-            keys_to_remove = [
-                k for k in self._cache
-                if len(k) >= 4 and k[0] == "sat" and timestamp in k[2:4]
-            ]
+            keys_to_remove = []
+            for k in self._cache:
+                if not k or k[0] != "sat":
+                    continue
+                if len(k) > 3 and k[1] == "multi":
+                    entry_ts = k[3]
+                elif len(k) > 2:
+                    entry_ts = k[2]
+                else:
+                    continue
+                if entry_ts == timestamp:
+                    keys_to_remove.append(k)
             for k in keys_to_remove:
                 self._total_bytes -= _size_of(self._cache[k])
                 del self._cache[k]
