@@ -232,16 +232,19 @@ class TileWarmer:
         max_zoom_total: int,
         enabled_regions: list[str] | None,
     ) -> dict[int, list[tuple[int, int]]]:
+        # Every zoom level warms only tiles overlapping an enabled region.
+        # Tiles with no region overlap render as fully transparent — cheap
+        # to produce on demand, so pre-building them (and permanently
+        # caching their per-tile coordinate grids) is pure waste.  With a
+        # BBOX configured the regions are already cropped to it, so this
+        # bounds the warm set to the operator's coverage area at all zooms.
         tiles_by_zoom: dict[int, list[tuple[int, int]]] = {}
         for z in range(max_zoom_total + 1):
             n = 2**z
-            if z <= max_zoom:
-                tiles_by_zoom[z] = [(x, y) for y in range(n) for x in range(n)]
-            else:
-                tiles_by_zoom[z] = [
-                    (x, y) for y in range(n) for x in range(n)
-                    if overlapping_regions(z, x, y, enabled_regions)
-                ]
+            tiles_by_zoom[z] = [
+                (x, y) for y in range(n) for x in range(n)
+                if overlapping_regions(z, x, y, enabled_regions)
+            ]
         return tiles_by_zoom
 
     async def warm_overview(
@@ -260,10 +263,10 @@ class TileWarmer:
         - "nowcast": only nowcast store timestamps
         - "both": all timestamps (default)
 
-        Two zoom passes:
-        - Zooms 0..max_zoom render every tile (global view).
-        - Zooms max_zoom+1..max_zoom_regional render only tiles
-          whose bbox overlaps an enabled region.
+        Two zoom passes, both restricted to tiles whose bbox overlaps an
+        enabled region:
+        - Zooms 0..max_zoom (overview levels).
+        - Zooms max_zoom+1..max_zoom_regional (regional levels).
         """
         if max_zoom is None:
             max_zoom = settings.warm_overview_zoom
