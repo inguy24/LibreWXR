@@ -427,6 +427,7 @@ async def lifespan(app: FastAPI):
         ecmwf_grid=ecmwf_grid,
         nwp_chain=nwp_chain,
         satellite_grids=satellite_grids_by_slug,
+        satellite_bbox=settings.get_bbox(),
     )
 
     # Memory pressure monitor

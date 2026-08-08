@@ -82,7 +82,7 @@ src/librewxr/
     geostationary.py # Geostationary fixed-grid ↔ lat/lon projection (GOES/Himawari)
     cache.py         # Byte-capped LRU tile cache
     coordinates.py   # Tile/region coordinate transforms
-    warmer.py        # Background tile pre-rendering (radar + satellite). warm_satellite() pre-renders satellite tiles after each ingest cycle; single-flight — concurrent triggers (one per satellite family) coalesce into one live pass plus at most one trailing rerun, never overlapping full warms. warm_satellite_demand() provides demand-driven warming — on satellite tile cache miss, pre-renders all other timestamps at the same (z,x,y). Deploy: VIS disabled (`GOES_VIS_ENABLED=false`), IR-only
+    warmer.py        # Background tile pre-rendering (radar + satellite). Radar warm lists are region-overlap-filtered at ALL zoom levels (no world tiles). Satellite warm lists derive from the LIBREWXR_BBOX rectangle when set (satellite coverage is the geostationary disk, so BBOX areas beyond the radar composite's edges — e.g. ocean west of USCOMP's -126.0 — still warm); falls back to region overlap without a BBOX. warm_satellite() pre-renders satellite tiles after each ingest cycle; single-flight — concurrent triggers (one per satellite family) coalesce into one live pass plus at most one trailing rerun, never overlapping full warms. warm_satellite_demand() provides demand-driven warming — on satellite tile cache miss, pre-renders all other timestamps at the same (z,x,y). Deploy: VIS disabled (`GOES_VIS_ENABLED=false`), IR-only
   colors/
     schemes.py       # Color scheme definitions
 ```

@@ -60,3 +60,33 @@ class TestBuildTileLists:
         assert (0, 0) in tiles_by_zoom[0]
         for z in range(1, 7):
             assert tiles_by_zoom[z], f"z={z} list is empty"
+
+
+class TestBuildBboxTileLists:
+    """Satellite warm lists cover the full BBOX rectangle.
+
+    Radar-region overlap leaves BBOX areas beyond the radar composite
+    (e.g. ocean west of USCOMP's -126.0 edge) unwarmed; satellite data
+    exists there, so its warm list derives from the BBOX itself.
+    """
+
+    BBOX = (26.75, -129.5, 40.75, -105.5)  # SoCal deploy (S, W, N, E)
+
+    def test_west_ocean_strip_is_covered(self):
+        tiles = TileWarmer._build_bbox_tile_lists(7, self.BBOX)
+        # z=7 tiles are 2.8125 deg wide; x=17 spans -132.19..-129.375
+        # (clips the BBOX west edge), x=18 spans -129.375..-126.5625 —
+        # entirely west of USCOMP's -126.0 edge, inside the BBOX.
+        assert (17, 51) in tiles[7]
+        assert (18, 51) in tiles[7]
+
+    def test_tiles_outside_bbox_are_excluded(self):
+        tiles = TileWarmer._build_bbox_tile_lists(7, self.BBOX)
+        assert (64, 51) not in tiles[7]  # Greenwich meridian, not SoCal
+        n_world = 128 * 128
+        assert len(tiles[7]) < n_world / 50
+
+    def test_low_zoom_world_tile_included(self):
+        tiles = TileWarmer._build_bbox_tile_lists(2, self.BBOX)
+        assert (0, 0) in tiles[0]
+        assert all(tiles[z] for z in (0, 1, 2))

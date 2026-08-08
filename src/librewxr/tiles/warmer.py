@@ -8,10 +8,18 @@ from concurrent.futures import ThreadPoolExecutor
 from librewxr.config import settings
 from librewxr.data.store import FrameStore
 from librewxr.tiles.cache import TileCache
-from librewxr.tiles.coordinates import overlapping_regions
+from librewxr.tiles.coordinates import overlapping_regions, tile_bounds
 from librewxr.tiles.renderer import compute_tile_geometry
 
 logger = logging.getLogger(__name__)
+
+
+def _tile_intersects_bbox(
+    z: int, x: int, y: int,
+    south: float, west: float, north: float, east: float,
+) -> bool:
+    tw, ts, te, tn = tile_bounds(z, x, y)
+    return not (te < west or tw > east or tn < south or ts > north)
 
 
 class TileWarmer:
@@ -39,6 +47,7 @@ class TileWarmer:
         ecmwf_grid=None,
         nwp_chain=None,
         satellite_grids: dict[str, object] | None = None,
+        satellite_bbox: tuple[float, float, float, float] | None = None,
     ):
         self._store = store
         self._cache = cache
@@ -51,6 +60,13 @@ class TileWarmer:
         self._ecmwf_grid = ecmwf_grid
         self._nwp_chain = nwp_chain
         self._satellite_grids = satellite_grids
+        # Satellite coverage is the geostationary disk, not the radar
+        # regions — with a BBOX configured, satellite tiles are warmed
+        # for the full BBOX rectangle. Radar-region overlap would leave
+        # BBOX areas outside the radar composite (e.g. open ocean west
+        # of USCOMP's -126.0 edge) permanently unwarmed even though the
+        # satellite has data there (audit 2026-08-08).
+        self._satellite_bbox = satellite_bbox
         self._past_warm_triggered = False
         self._nowcast_warm_triggered = False
         self._past_warm_complete = False
@@ -244,6 +260,30 @@ class TileWarmer:
             tiles_by_zoom[z] = [
                 (x, y) for y in range(n) for x in range(n)
                 if overlapping_regions(z, x, y, enabled_regions)
+            ]
+        return tiles_by_zoom
+
+    @staticmethod
+    def _build_bbox_tile_lists(
+        max_zoom_total: int,
+        bbox: tuple[float, float, float, float],
+    ) -> dict[int, list[tuple[int, int]]]:
+        """Tile lists covering a geographic BBOX rectangle at every zoom.
+
+        Used for satellite warming: the satellite's coverage is its
+        geostationary disk, so within the operator's BBOX every tile has
+        potential data — unlike radar, whose composite regions can end
+        short of the BBOX edges.  ``bbox`` is (south, west, north, east).
+        """
+        south, west, north, east = bbox
+        tiles_by_zoom: dict[int, list[tuple[int, int]]] = {}
+        for z in range(max_zoom_total + 1):
+            n = 2**z
+            tiles_by_zoom[z] = [
+                (x, y)
+                for y in range(n)
+                for x in range(n)
+                if _tile_intersects_bbox(z, x, y, south, west, north, east)
             ]
         return tiles_by_zoom
 
@@ -620,9 +660,15 @@ class TileWarmer:
         if max_zoom_total < 0:
             return
 
-        tiles_by_zoom = self._build_tile_lists(
-            max_zoom, max_zoom_regional, max_zoom_total, self._enabled_regions,
-        )
+        if self._satellite_bbox is not None:
+            tiles_by_zoom = self._build_bbox_tile_lists(
+                max_zoom_total, self._satellite_bbox,
+            )
+        else:
+            tiles_by_zoom = self._build_tile_lists(
+                max_zoom, max_zoom_regional, max_zoom_total,
+                self._enabled_regions,
+            )
 
         tile_size = 512
         fmt = "webp"
