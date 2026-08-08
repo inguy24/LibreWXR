@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
 import math
-from functools import lru_cache
+from collections import OrderedDict, namedtuple
+from threading import Lock
 
 import numpy as np
 
@@ -171,8 +172,74 @@ def _tmerc_pixel_coords(
 
 # ── Region-aware coordinate functions ────────────────────────────────
 
+_CacheInfo = namedtuple("_CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
-@lru_cache(maxsize=settings.coord_cache_size)
+
+def _sized_lru_cache(maxsize: int):
+    """Thread-safe LRU memoizer that measures actual result-array bytes.
+
+    Drop-in for ``functools.lru_cache`` within this module: exposes the
+    same ``cache_info()`` / ``cache_clear()`` surface, plus
+    ``cache_bytes()`` returning the measured size of resident entries.
+    Exists because entry sizes here vary 4x with the ``tile_size``
+    argument (256 px ≈ 0.5 MB, 512 px ≈ 2 MB) — a count-based estimate
+    misattributed ~134 MB of 512 px satellite entries to "other" in the
+    /health breakdown (audit 2026-08-08).
+    """
+
+    def decorator(fn):
+        cache: OrderedDict[tuple, tuple] = OrderedDict()
+        lock = Lock()
+        stats = {"hits": 0, "misses": 0, "bytes": 0}
+
+        def _entry_bytes(result: tuple) -> int:
+            return sum(int(a.nbytes) for a in result)
+
+        def wrapper(*args):
+            with lock:
+                if args in cache:
+                    cache.move_to_end(args)
+                    stats["hits"] += 1
+                    return cache[args]
+                stats["misses"] += 1
+            result = fn(*args)
+            with lock:
+                if args not in cache:
+                    cache[args] = result
+                    stats["bytes"] += _entry_bytes(result)
+                    while len(cache) > maxsize:
+                        _, evicted = cache.popitem(last=False)
+                        stats["bytes"] -= _entry_bytes(evicted)
+            return result
+
+        def cache_info() -> _CacheInfo:
+            with lock:
+                return _CacheInfo(
+                    stats["hits"], stats["misses"], maxsize, len(cache)
+                )
+
+        def cache_clear() -> None:
+            with lock:
+                cache.clear()
+                stats["hits"] = 0
+                stats["misses"] = 0
+                stats["bytes"] = 0
+
+        def cache_bytes() -> int:
+            with lock:
+                return stats["bytes"]
+
+        wrapper.cache_info = cache_info
+        wrapper.cache_clear = cache_clear
+        wrapper.cache_bytes = cache_bytes
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+
+    return decorator
+
+
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -215,7 +282,7 @@ def region_pixel_indices(
     return row_idx, col_idx
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_padded(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -254,7 +321,7 @@ def region_pixel_indices_padded(
     return row_idx, col_idx
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_fractional(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -284,7 +351,7 @@ def region_pixel_indices_fractional(
     return row_grid, col_grid
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_fractional_padded(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -344,7 +411,7 @@ def overlapping_regions(
     return result
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_latlons(
     z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -369,7 +436,7 @@ def tile_pixel_latlons(
     return lat_grid, lon_grid
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_latlons_padded(
     z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -401,7 +468,7 @@ def tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
     return west, south, east, north
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_indices(
     z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -409,7 +476,7 @@ def tile_pixel_indices(
     return region_pixel_indices(_USCOMP, z, x, y, tile_size)
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_indices_padded(
     z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -417,7 +484,7 @@ def tile_pixel_indices_padded(
     return region_pixel_indices_padded(_USCOMP, z, x, y, tile_size, pad)
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_sized_lru_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_indices_fractional(
     z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -459,13 +526,18 @@ def warm_coordinate_caches(
                 if not regions:
                     continue
                 # Tile-level lat/lon grids (used by ECMWF fallback, arrows)
+                # Positional args only: the render path calls these
+                # positionally, and cache keys are argument-shape
+                # sensitive — a pad=8 kwarg here would warm entries the
+                # render path could never hit (true under functools.
+                # lru_cache as well; latent since the warmer was added).
                 tile_pixel_latlons(z, x, y, tile_size)
-                tile_pixel_latlons_padded(z, x, y, tile_size, pad=8)
+                tile_pixel_latlons_padded(z, x, y, tile_size, 8)
                 for region in regions:
                     region_pixel_indices(region, z, x, y, tile_size)
-                    region_pixel_indices_padded(region, z, x, y, tile_size, pad=8)
+                    region_pixel_indices_padded(region, z, x, y, tile_size, 8)
                     region_pixel_indices_fractional(region, z, x, y, tile_size)
-                    region_pixel_indices_fractional_padded(region, z, x, y, tile_size, pad=8)
+                    region_pixel_indices_fractional_padded(region, z, x, y, tile_size, 8)
                     warmed += 1
     return warmed
 
@@ -482,25 +554,6 @@ ALL_CACHES = [
     tile_pixel_latlons,
     tile_pixel_latlons_padded,
 ]
-
-# Per-cache estimate of how many bytes each cached result tuple consumes.
-# Calculated as: 2 arrays × dtype_size × rows × cols.
-# Defaults assume tile_size=256, pad=8 (padded: 272).
-_CACHE_ENTRY_BYTES = {
-    # region_pixel_indices: 2 × int32 × 256 × 256
-    region_pixel_indices: 2 * 4 * 256 * 256,
-    # region_pixel_indices_padded: 2 × int32 × 272 × 272
-    region_pixel_indices_padded: 2 * 4 * 272 * 272,
-    # region_pixel_indices_fractional: 2 × float32 × 256 × 256
-    region_pixel_indices_fractional: 2 * 4 * 256 * 256,
-    # region_pixel_indices_fractional_padded: 2 × float32 × 272 × 272
-    region_pixel_indices_fractional_padded: 2 * 4 * 272 * 272,
-    # tile_pixel_latlons: 2 × float32 × 256 × 256
-    tile_pixel_latlons: 2 * 4 * 256 * 256,
-    # tile_pixel_latlons_padded: 2 × float32 × 272 × 272
-    tile_pixel_latlons_padded: 2 * 4 * 272 * 272,
-}
-
 
 def coord_cache_stats() -> dict:
     """Per-cache hit/miss/fill stats for the /health endpoint.
@@ -526,17 +579,11 @@ def coord_cache_stats() -> dict:
 
 
 def coord_cache_bytes() -> int:
-    """Estimate total memory consumed by all coordinate LRU caches.
+    """Total memory consumed by all coordinate LRU caches, measured.
 
-    Uses ``lru_cache.cache_info().currsize`` (number of populated entries)
-    multiplied by the per-entry byte cost of each cache's return value.
-
-    This is an approximation — entries called with non-default tile_size
-    or pad values will have different sizes, but the vast majority of
-    calls use the defaults (256 / 8).
+    Sums each cache's ``cache_bytes()`` — the actual ``nbytes`` of every
+    resident entry, recorded at insert/evict time. Replaces the old
+    count × fixed-size estimate, which assumed 256 px entries and
+    under-reported 512 px satellite entries 4x.
     """
-    total = 0
-    for fn in ALL_CACHES:
-        info = fn.cache_info()
-        total += info.currsize * _CACHE_ENTRY_BYTES[fn]
-    return total
+    return sum(fn.cache_bytes() for fn in ALL_CACHES)
