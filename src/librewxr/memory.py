@@ -70,6 +70,26 @@ def detect_memory_limit_mb(override_mb: int = 0) -> int:
     return psutil.virtual_memory().total // (1024 * 1024)
 
 
+def read_cgroup_swap_usage() -> int | None:
+    """Return the cgroup's current swap usage in bytes, or None.
+
+    Swap is excluded from cgroup v2 ``memory.current``, so a container
+    can page out past its RAM cap while the monitor's percentage stays
+    flat. /health surfaces this separately so the true footprint
+    (RAM + swap) is visible to the operator.
+    """
+    try:
+        v2 = Path("/sys/fs/cgroup/memory.swap.current").read_text().strip()
+        return int(v2)
+    except (FileNotFoundError, ValueError, PermissionError):
+        return None
+
+
+def read_cgroup_memory_usage() -> int | None:
+    """Public alias for the cgroup memory reading the monitor acts on."""
+    return _read_cgroup_memory_usage()
+
+
 def _read_cgroup_memory_usage() -> int | None:
     """Return the cgroup's current memory usage in bytes, or None.
 

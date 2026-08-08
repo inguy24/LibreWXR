@@ -23,7 +23,11 @@ from librewxr.api.models import (
 from librewxr.colors.schemes import SCHEME_NAMES
 from librewxr.config import settings
 from librewxr.data.store import FrameStore
-from librewxr.memory import detect_memory_limit_mb
+from librewxr.memory import (
+    detect_memory_limit_mb,
+    read_cgroup_memory_usage,
+    read_cgroup_swap_usage,
+)
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import coord_cache_bytes, coord_cache_stats
 from librewxr.tiles.renderer import (
@@ -168,6 +172,23 @@ async def health():
         "other_mb": round(other_bytes / (1024 * 1024), 1),
     })
 
+    # resident_mb/usage_pct are this process's RSS — kept for backward
+    # compatibility. The MemoryMonitor acts on the cgroup-wide figure
+    # (cgroup_mb / monitor_usage_pct), which includes page cache and all
+    # container processes; swap_mb is excluded from both and reported
+    # separately so the true footprint is visible (audit 2026-08-08:
+    # /health showed up to ~19 points more headroom than reality).
+    cgroup_bytes = read_cgroup_memory_usage()
+    swap_bytes = read_cgroup_swap_usage()
+    monitor_fields = {}
+    if cgroup_bytes is not None:
+        monitor_fields["cgroup_mb"] = round(cgroup_bytes / (1024 * 1024), 1)
+        monitor_fields["monitor_usage_pct"] = round(
+            cgroup_bytes / (mem_limit_mb * 1024 * 1024) * 100, 1
+        )
+    if swap_bytes is not None:
+        monitor_fields["swap_mb"] = round(swap_bytes / (1024 * 1024), 1)
+
     return {
         "status": "ok" if frame_count > 0 else "degraded",
         "uptime_seconds": uptime,
@@ -175,6 +196,7 @@ async def health():
             "resident_mb": round(rss_mb, 1),
             "limit_mb": round(mem_limit_mb, 1),
             "usage_pct": ram_usage,
+            **monitor_fields,
             "breakdown": breakdown,
         },
         "frames": {
