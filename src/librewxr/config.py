@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     workers: int = 0  # Number of uvicorn worker processes; 0 = mode default
     warmer_threads: int = 0  # Render thread pool size; 0 = mode default (auto in single, 4 in multi)
     warm_coord_zoom: int = 6  # Pre-warm coordinate caches up to this zoom (0 = disable)
-    warm_overview_zoom: int = 4  # Pre-render ALL tiles up to this zoom on each fetch (-1 = disable)
+    warm_overview_zoom: int = 4  # Pre-render region-overlapping tiles up to this zoom on each fetch (-1 = disable)
     warm_overview_zoom_regional: int = 6  # Pre-render tiles overlapping enabled regions up to this zoom (-1 = disable)
     enabled_regions: str = "ALL"  # Region spec: CONUS, US, ALL, or comma-separated region names
     # Global radar-layer toggle.  When False, no radar provider gets
